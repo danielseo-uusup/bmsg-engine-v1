@@ -49,20 +49,46 @@ def create_distance_matrix(df):
     return dist_matrix
 
 
+def kmeans_plusplus_init(coords, num_clusters):
+    """K-Means++ 초기화: 더 나은 초기 중심점 선택"""
+    n = len(coords)
+    centroids = []
+    
+    # 첫 번째 중심점: 랜덤 선택
+    first_idx = np.random.randint(0, n)
+    centroids.append(coords[first_idx])
+    
+    for _ in range(1, num_clusters):
+        # 각 점에서 가장 가까운 중심점까지의 거리 계산
+        min_distances = []
+        for i in range(n):
+            min_dist = float('inf')
+            for c in centroids:
+                dist = haversine(coords[i][0], coords[i][1], c[0], c[1])
+                min_dist = min(min_dist, dist)
+            min_distances.append(min_dist)
+        
+        # 거리의 제곱에 비례하는 확률로 다음 중심점 선택
+        min_distances = np.array(min_distances)
+        probs = min_distances ** 2
+        probs = probs / probs.sum()
+        
+        next_idx = np.random.choice(n, p=probs)
+        centroids.append(coords[next_idx])
+    
+    return np.array(centroids)
+
+
 def kmeans_clustering(coords, num_clusters, max_iter=100):
-    """
-    순수 NumPy K-Means 구현 (sklearn 의존성 제거)
-    - 지리적 근접성 기반 클러스터링
-    - 가까운 점들끼리 자연스럽게 묶임
-    """
+    """K-Means++ 클러스터링"""
     n = len(coords)
     
     if n <= num_clusters:
         return list(range(n))
     
-    # 초기 중심점: 데이터에서 균등하게 선택
-    indices = np.linspace(0, n - 1, num_clusters, dtype=int)
-    centroids = coords[indices].copy()
+    # K-Means++ 초기화
+    np.random.seed(42)  # 재현성
+    centroids = kmeans_plusplus_init(coords, num_clusters)
     
     labels = np.zeros(n, dtype=int)
     
@@ -86,26 +112,20 @@ def kmeans_clustering(coords, num_clusters, max_iter=100):
             else:
                 new_centroids[j] = centroids[j]
         
-        # 수렴 체크
         if np.allclose(centroids, new_centroids, atol=1e-6):
             break
         
         centroids = new_centroids
     
-    return labels.tolist()
+    return labels.tolist(), centroids
 
 
-def balance_clusters(df, labels, num_clusters):
+def reassign_outliers(df, num_clusters):
     """
-    클러스터 크기 균형 조정
-    - 너무 큰 클러스터에서 가장자리 점을 인접 클러스터로 이동
+    Outlier 재배정: 클러스터 중심에서 너무 먼 점은 더 가까운 클러스터로 이동
+    - 파란색처럼 두 지역에 걸친 클러스터 문제 해결
     """
     df = df.copy()
-    df['cluster'] = labels
-    
-    target_size = len(df) // num_clusters
-    max_size = target_size + 2
-    min_size = max(1, target_size - 2)
     
     # 클러스터 중심점 계산
     centroids = {}
@@ -114,22 +134,107 @@ def balance_clusters(df, labels, num_clusters):
         if len(cluster_points) > 0:
             centroids[c] = cluster_points.mean(axis=0)
     
-    # 반복적으로 균형 조정
-    for _ in range(10):
-        cluster_sizes = df['cluster'].value_counts().to_dict()
+    # 각 클러스터의 평균 거리(반경) 계산
+    cluster_radius = {}
+    for c in range(num_clusters):
+        cluster_df = df[df['cluster'] == c]
+        if len(cluster_df) > 0:
+            distances = []
+            for _, row in cluster_df.iterrows():
+                dist = haversine(row['lat'], row['lon'], 
+                               centroids[c][0], centroids[c][1])
+                distances.append(dist)
+            cluster_radius[c] = np.mean(distances) if distances else 0
+    
+    # Outlier 감지 및 재배정
+    changed = True
+    iterations = 0
+    max_iterations = 10
+    
+    while changed and iterations < max_iterations:
+        changed = False
+        iterations += 1
+        
+        for idx, row in df.iterrows():
+            if row['cluster'] == -1:
+                continue
+            
+            current_cluster = int(row['cluster'])
+            current_dist = haversine(row['lat'], row['lon'],
+                                    centroids[current_cluster][0], 
+                                    centroids[current_cluster][1])
+            
+            # 현재 클러스터 평균 반경의 2배 이상 떨어져 있으면 outlier
+            threshold = cluster_radius.get(current_cluster, 10) * 2
+            
+            if current_dist > threshold:
+                # 더 가까운 클러스터 찾기
+                best_cluster = current_cluster
+                min_dist = current_dist
+                
+                for c in range(num_clusters):
+                    if c != current_cluster and c in centroids:
+                        dist = haversine(row['lat'], row['lon'],
+                                       centroids[c][0], centroids[c][1])
+                        # 다른 클러스터가 현재보다 50% 이상 가까우면 이동
+                        if dist < min_dist * 0.7:
+                            min_dist = dist
+                            best_cluster = c
+                
+                if best_cluster != current_cluster:
+                    df.loc[idx, 'cluster'] = best_cluster
+                    changed = True
+        
+        # 중심점 및 반경 재계산
+        if changed:
+            for c in range(num_clusters):
+                cluster_points = df[df['cluster'] == c][['lat', 'lon']].values
+                if len(cluster_points) > 0:
+                    centroids[c] = cluster_points.mean(axis=0)
+                    distances = []
+                    cluster_df = df[df['cluster'] == c]
+                    for _, row in cluster_df.iterrows():
+                        dist = haversine(row['lat'], row['lon'], 
+                                       centroids[c][0], centroids[c][1])
+                        distances.append(dist)
+                    cluster_radius[c] = np.mean(distances) if distances else 0
+    
+    return df
+
+
+def balance_clusters(df, num_clusters, target_variance=3):
+    """클러스터 크기 균형 조정"""
+    df = df.copy()
+    
+    non_depot = df[df['cluster'] != -1]
+    target_size = len(non_depot) // num_clusters
+    max_size = target_size + target_variance
+    min_size = max(1, target_size - target_variance)
+    
+    # 클러스터 중심점
+    centroids = {}
+    for c in range(num_clusters):
+        cluster_points = df[df['cluster'] == c][['lat', 'lon']].values
+        if len(cluster_points) > 0:
+            centroids[c] = cluster_points.mean(axis=0)
+    
+    for _ in range(20):
+        cluster_sizes = df[df['cluster'] != -1]['cluster'].value_counts().to_dict()
         
         balanced = True
         for c in range(num_clusters):
             size = cluster_sizes.get(c, 0)
+            
             if size > max_size:
                 balanced = False
-                # 가장 먼 점을 찾아서 다른 클러스터로 이동
                 cluster_df = df[df['cluster'] == c]
                 
                 # 중심에서 가장 먼 점 찾기
                 max_dist = -1
                 farthest_idx = None
                 for idx, row in cluster_df.iterrows():
+                    if c not in centroids:
+                        continue
                     dist = haversine(row['lat'], row['lon'], 
                                    centroids[c][0], centroids[c][1])
                     if dist > max_dist:
@@ -137,13 +242,13 @@ def balance_clusters(df, labels, num_clusters):
                         farthest_idx = idx
                 
                 if farthest_idx is not None:
-                    # 가장 가까운 다른 클러스터 찾기
                     point = df.loc[farthest_idx, ['lat', 'lon']].values
                     min_dist = float('inf')
                     best_cluster = c
                     
                     for other_c in range(num_clusters):
-                        if other_c != c and cluster_sizes.get(other_c, 0) < max_size:
+                        other_size = cluster_sizes.get(other_c, 0)
+                        if other_c != c and other_size < max_size and other_c in centroids:
                             dist = haversine(point[0], point[1],
                                            centroids[other_c][0], centroids[other_c][1])
                             if dist < min_dist:
@@ -152,59 +257,56 @@ def balance_clusters(df, labels, num_clusters):
                     
                     if best_cluster != c:
                         df.loc[farthest_idx, 'cluster'] = best_cluster
+                        # 중심점 재계산
+                        for cc in [c, best_cluster]:
+                            cluster_points = df[df['cluster'] == cc][['lat', 'lon']].values
+                            if len(cluster_points) > 0:
+                                centroids[cc] = cluster_points.mean(axis=0)
         
         if balanced:
             break
     
-    return df['cluster'].tolist()
+    return df
 
 
 def create_geo_clusters(df, num_vehicles, depot_idx=0):
-    """
-    K-Means 기반 지리적 클러스터링
-    - 가까운 점들끼리 자연스럽게 묶임
-    - 클러스터 크기 균형 조정 포함
-    """
-    # depot 제외한 좌표
-    non_depot_mask = df.index != depot_idx
-    non_depot_df = df[non_depot_mask].copy()
+    """K-Means++ 지리적 클러스터링 + Outlier 재배정"""
+    df = df.copy()
+    df['cluster'] = -1  # 초기화
     
-    if len(non_depot_df) == 0:
-        df = df.copy()
-        df['cluster'] = -1
+    # depot 제외
+    non_depot_indices = [i for i in range(len(df)) if i != depot_idx]
+    
+    if len(non_depot_indices) == 0:
         return df
     
-    coords = non_depot_df[['lat', 'lon']].values
+    coords = df.loc[non_depot_indices, ['lat', 'lon']].values
     
-    # K-Means 클러스터링
-    labels = kmeans_clustering(coords, num_vehicles)
+    # K-Means++ 클러스터링
+    labels, _ = kmeans_clustering(coords, num_vehicles)
+    
+    # 라벨 할당
+    for i, idx in enumerate(non_depot_indices):
+        df.loc[idx, 'cluster'] = labels[i]
+    
+    # Outlier 재배정 (핵심!)
+    df = reassign_outliers(df, num_vehicles)
     
     # 균형 조정
-    non_depot_df['cluster'] = labels
-    balanced_labels = balance_clusters(non_depot_df, labels, num_vehicles)
-    non_depot_df['cluster'] = balanced_labels
-    
-    # 전체 DataFrame에 클러스터 할당
-    df = df.copy()
-    df['cluster'] = -1  # 기본값 (depot)
-    
-    for idx, cluster in zip(non_depot_df.index, non_depot_df['cluster']):
-        df.loc[idx, 'cluster'] = cluster
+    df = balance_clusters(df, num_vehicles)
     
     return df
 
 
 def solve_tsp_within_cluster(cluster_df, depot_coords):
-    """
-    클러스터 내 TSP 최적화 (OR-Tools 사용)
-    """
+    """클러스터 내 TSP 최적화"""
     if len(cluster_df) == 0:
         return []
     
     if len(cluster_df) == 1:
         return [cluster_df.iloc[0]['id']]
     
-    # depot을 임시로 추가 (인덱스 0)
+    # depot 추가
     temp_data = [{
         'id': '__depot__',
         'lat': depot_coords[0],
@@ -219,11 +321,9 @@ def solve_tsp_within_cluster(cluster_df, depot_coords):
         })
     
     temp_df = pd.DataFrame(temp_data)
-    
-    # 거리 행렬 생성
     dist_matrix = create_distance_matrix(temp_df)
     
-    # OR-Tools 설정
+    # OR-Tools
     manager = pywrapcp.RoutingIndexManager(len(temp_df), 1, 0)
     routing = pywrapcp.RoutingModel(manager)
     
@@ -235,7 +335,6 @@ def solve_tsp_within_cluster(cluster_df, depot_coords):
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
     
-    # 검색 파라미터
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
@@ -246,15 +345,13 @@ def solve_tsp_within_cluster(cluster_df, depot_coords):
     solution = routing.SolveWithParameters(search_parameters)
     
     if not solution:
-        # 풀이 실패 시 Nearest Neighbor
         return nearest_neighbor_order(cluster_df, depot_coords)
     
-    # 결과 추출 (depot 제외)
     route = []
     index = routing.Start(0)
     while not routing.IsEnd(index):
         node_index = manager.IndexToNode(index)
-        if node_index != 0:  # depot 제외
+        if node_index != 0:
             route.append(temp_df.iloc[node_index]['id'])
         index = solution.Value(routing.NextVar(index))
     
@@ -262,7 +359,7 @@ def solve_tsp_within_cluster(cluster_df, depot_coords):
 
 
 def nearest_neighbor_order(cluster_df, depot_coords):
-    """Nearest Neighbor 휴리스틱 (백업용)"""
+    """Nearest Neighbor 휴리스틱"""
     if len(cluster_df) == 0:
         return []
     
@@ -272,7 +369,6 @@ def nearest_neighbor_order(cluster_df, depot_coords):
     
     visited = [False] * n
     order = []
-    
     current_lat, current_lon = depot_coords
     
     for _ in range(n):
@@ -296,47 +392,61 @@ def nearest_neighbor_order(cluster_df, depot_coords):
 
 @app.get("/")
 def read_root():
-    return {"status": "active", "message": "VRP Engine V6 (K-Means Geo Clustering)"}
+    return {"status": "active", "message": "VRP Engine V7 (K-Means++ with Outlier Reassignment)"}
 
 
 @app.post("/optimize")
 def optimize_routes(body: RequestBody):
     """
-    2단계 최적화:
-    1) K-Means 지리적 클러스터링 → 가까운 점끼리 묶임
-    2) 각 클러스터 내 TSP 최적화 → 동선 최적화
+    3단계 최적화:
+    1) K-Means++ 클러스터링
+    2) Outlier 재배정 (두 지역에 걸친 클러스터 해결)
+    3) 각 클러스터 내 TSP 최적화
     
-    ★ 미배정 0건 보장
+    ★ 미배정 0건 절대 보장
     """
     # 1. 데이터 준비
-    df = pd.DataFrame([loc.dict() for loc in body.locations])
-    df = df.reset_index(drop=True)  # 인덱스 정리
+    data = [loc.dict() for loc in body.locations]
+    df = pd.DataFrame(data)
+    df = df.reset_index(drop=True)
     
-    if len(df) < 2:
+    total_locations = len(df) - 1  # depot 제외
+    
+    if total_locations < 1:
         return {"status": "error", "message": "Not enough locations"}
     
     num_vehicles = body.num_vehicles
     depot_coords = (df.iloc[0]['lat'], df.iloc[0]['lon'])
     
-    # 2. K-Means 지리적 클러스터링
+    # 2. 클러스터링 (K-Means++ + Outlier 재배정)
     df = create_geo_clusters(df, num_vehicles, depot_idx=0)
     
-    # ★ 미배정 체크 및 강제 할당
-    unassigned = df[(df['cluster'] == -1) & (df.index != 0)]
-    if len(unassigned) > 0:
-        # 미배정 점들을 가장 가까운 클러스터에 강제 할당
-        for idx, row in unassigned.iterrows():
+    # ★★★ 미배정 강제 할당 (절대 미배정 없음) ★★★
+    unassigned_mask = (df['cluster'] == -1) & (df.index != 0)
+    unassigned_indices = df[unassigned_mask].index.tolist()
+    
+    if len(unassigned_indices) > 0:
+        # 각 클러스터 중심 계산
+        centroids = {}
+        for c in range(num_vehicles):
+            cluster_points = df[df['cluster'] == c][['lat', 'lon']].values
+            if len(cluster_points) > 0:
+                centroids[c] = cluster_points.mean(axis=0)
+            else:
+                # 빈 클러스터면 depot 위치 사용
+                centroids[c] = np.array(depot_coords)
+        
+        for idx in unassigned_indices:
+            row = df.loc[idx]
             min_dist = float('inf')
             best_cluster = 0
             
             for c in range(num_vehicles):
-                cluster_points = df[df['cluster'] == c][['lat', 'lon']].values
-                if len(cluster_points) > 0:
-                    centroid = cluster_points.mean(axis=0)
-                    dist = haversine(row['lat'], row['lon'], centroid[0], centroid[1])
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_cluster = c
+                dist = haversine(row['lat'], row['lon'], 
+                               centroids[c][0], centroids[c][1])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_cluster = c
             
             df.loc[idx, 'cluster'] = best_cluster
     
@@ -355,17 +465,15 @@ def optimize_routes(body: RequestBody):
             })
             continue
         
-        # TSP 최적화
         optimized_order = solve_tsp_within_cluster(cluster_df, depot_coords)
         
-        # 결과 저장
         for node_id in optimized_order:
             results.append({
                 "id": node_id,
                 "driver": f"기사 {cluster_id + 1}"
             })
         
-        # 통계 계산
+        # 통계
         total_distance = 0
         prev_lat, prev_lon = depot_coords
         
@@ -373,10 +481,10 @@ def optimize_routes(body: RequestBody):
             node_row = cluster_df[cluster_df['id'] == node_id]
             if len(node_row) > 0:
                 node_data = node_row.iloc[0]
-                total_distance += haversine(prev_lat, prev_lon, node_data['lat'], node_data['lon'])
+                total_distance += haversine(prev_lat, prev_lon, 
+                                          node_data['lat'], node_data['lon'])
                 prev_lat, prev_lon = node_data['lat'], node_data['lon']
         
-        # depot 복귀 거리 추가
         total_distance += haversine(prev_lat, prev_lon, depot_coords[0], depot_coords[1])
         
         stats.append({
@@ -387,7 +495,25 @@ def optimize_routes(body: RequestBody):
     
     # 4. 최종 검증
     total_assigned = len(results)
-    total_locations = len(df) - 1  # depot 제외
+    unassigned_count = total_locations - total_assigned
+    
+    # 만약 아직도 미배정이 있으면 에러 로그
+    if unassigned_count > 0:
+        # 디버깅: 어떤 점이 미배정인지 확인
+        assigned_ids = set([r['id'] for r in results])
+        all_ids = set(df[df.index != 0]['id'].tolist())
+        missing_ids = all_ids - assigned_ids
+        
+        return {
+            "status": "warning",
+            "message": f"미배정 {unassigned_count}건 발생",
+            "missing_ids": list(missing_ids),
+            "updates": results,
+            "statistics": stats,
+            "total_assigned": total_assigned,
+            "total_locations": total_locations,
+            "unassigned": unassigned_count
+        }
     
     return {
         "status": "success",
@@ -395,7 +521,7 @@ def optimize_routes(body: RequestBody):
         "statistics": stats,
         "total_assigned": total_assigned,
         "total_locations": total_locations,
-        "unassigned": total_locations - total_assigned  # 항상 0이어야 함
+        "unassigned": 0
     }
 
 
