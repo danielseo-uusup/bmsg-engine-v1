@@ -49,43 +49,147 @@ def create_distance_matrix(df):
     return dist_matrix
 
 
-def create_sector_clusters(df, num_vehicles, depot_idx=0):
+def kmeans_clustering(coords, num_clusters, max_iter=100):
     """
-    Depot 기준 방위각으로 섹터 분할 (꽃잎 모양)
-    - 각 기사가 명확한 지리적 구역을 담당하게 됨
+    순수 NumPy K-Means 구현 (sklearn 의존성 제거)
+    - 지리적 근접성 기반 클러스터링
+    - 가까운 점들끼리 자연스럽게 묶임
     """
-    depot_lat = df.iloc[depot_idx]['lat']
-    depot_lon = df.iloc[depot_idx]['lon']
+    n = len(coords)
     
-    # 각 포인트의 depot 기준 방위각 계산
-    angles = []
-    indices = []
+    if n <= num_clusters:
+        return list(range(n))
     
-    for idx in range(len(df)):
-        if idx == depot_idx:
-            continue
+    # 초기 중심점: 데이터에서 균등하게 선택
+    indices = np.linspace(0, n - 1, num_clusters, dtype=int)
+    centroids = coords[indices].copy()
+    
+    labels = np.zeros(n, dtype=int)
+    
+    for _ in range(max_iter):
+        # 각 점을 가장 가까운 중심점에 할당
+        for i in range(n):
+            min_dist = float('inf')
+            for j in range(num_clusters):
+                dist = haversine(coords[i][0], coords[i][1], 
+                               centroids[j][0], centroids[j][1])
+                if dist < min_dist:
+                    min_dist = dist
+                    labels[i] = j
         
-        dy = df.iloc[idx]['lat'] - depot_lat
-        dx = df.iloc[idx]['lon'] - depot_lon
-        angle = np.arctan2(dy, dx)
-        angles.append(angle)
-        indices.append(idx)
+        # 중심점 업데이트
+        new_centroids = np.zeros_like(centroids)
+        for j in range(num_clusters):
+            cluster_points = coords[labels == j]
+            if len(cluster_points) > 0:
+                new_centroids[j] = cluster_points.mean(axis=0)
+            else:
+                new_centroids[j] = centroids[j]
+        
+        # 수렴 체크
+        if np.allclose(centroids, new_centroids, atol=1e-6):
+            break
+        
+        centroids = new_centroids
     
-    # 방위각 기준 정렬
-    sorted_pairs = sorted(zip(angles, indices), key=lambda x: x[0])
-    sorted_indices = [pair[1] for pair in sorted_pairs]
-    
-    # 균등 분할
-    splits = np.array_split(sorted_indices, num_vehicles)
-    
-    # 클러스터 라벨 할당
-    cluster_labels = {depot_idx: -1}  # depot은 -1
-    for cluster_id, split in enumerate(splits):
-        for idx in split:
-            cluster_labels[idx] = cluster_id
-    
+    return labels.tolist()
+
+
+def balance_clusters(df, labels, num_clusters):
+    """
+    클러스터 크기 균형 조정
+    - 너무 큰 클러스터에서 가장자리 점을 인접 클러스터로 이동
+    """
     df = df.copy()
-    df['cluster'] = df.index.map(lambda x: cluster_labels.get(x, -1))
+    df['cluster'] = labels
+    
+    target_size = len(df) // num_clusters
+    max_size = target_size + 2
+    min_size = max(1, target_size - 2)
+    
+    # 클러스터 중심점 계산
+    centroids = {}
+    for c in range(num_clusters):
+        cluster_points = df[df['cluster'] == c][['lat', 'lon']].values
+        if len(cluster_points) > 0:
+            centroids[c] = cluster_points.mean(axis=0)
+    
+    # 반복적으로 균형 조정
+    for _ in range(10):
+        cluster_sizes = df['cluster'].value_counts().to_dict()
+        
+        balanced = True
+        for c in range(num_clusters):
+            size = cluster_sizes.get(c, 0)
+            if size > max_size:
+                balanced = False
+                # 가장 먼 점을 찾아서 다른 클러스터로 이동
+                cluster_df = df[df['cluster'] == c]
+                
+                # 중심에서 가장 먼 점 찾기
+                max_dist = -1
+                farthest_idx = None
+                for idx, row in cluster_df.iterrows():
+                    dist = haversine(row['lat'], row['lon'], 
+                                   centroids[c][0], centroids[c][1])
+                    if dist > max_dist:
+                        max_dist = dist
+                        farthest_idx = idx
+                
+                if farthest_idx is not None:
+                    # 가장 가까운 다른 클러스터 찾기
+                    point = df.loc[farthest_idx, ['lat', 'lon']].values
+                    min_dist = float('inf')
+                    best_cluster = c
+                    
+                    for other_c in range(num_clusters):
+                        if other_c != c and cluster_sizes.get(other_c, 0) < max_size:
+                            dist = haversine(point[0], point[1],
+                                           centroids[other_c][0], centroids[other_c][1])
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_cluster = other_c
+                    
+                    if best_cluster != c:
+                        df.loc[farthest_idx, 'cluster'] = best_cluster
+        
+        if balanced:
+            break
+    
+    return df['cluster'].tolist()
+
+
+def create_geo_clusters(df, num_vehicles, depot_idx=0):
+    """
+    K-Means 기반 지리적 클러스터링
+    - 가까운 점들끼리 자연스럽게 묶임
+    - 클러스터 크기 균형 조정 포함
+    """
+    # depot 제외한 좌표
+    non_depot_mask = df.index != depot_idx
+    non_depot_df = df[non_depot_mask].copy()
+    
+    if len(non_depot_df) == 0:
+        df = df.copy()
+        df['cluster'] = -1
+        return df
+    
+    coords = non_depot_df[['lat', 'lon']].values
+    
+    # K-Means 클러스터링
+    labels = kmeans_clustering(coords, num_vehicles)
+    
+    # 균형 조정
+    non_depot_df['cluster'] = labels
+    balanced_labels = balance_clusters(non_depot_df, labels, num_vehicles)
+    non_depot_df['cluster'] = balanced_labels
+    
+    # 전체 DataFrame에 클러스터 할당
+    df = df.copy()
+    df['cluster'] = -1  # 기본값 (depot)
+    
+    for idx, cluster in zip(non_depot_df.index, non_depot_df['cluster']):
+        df.loc[idx, 'cluster'] = cluster
     
     return df
 
@@ -93,7 +197,6 @@ def create_sector_clusters(df, num_vehicles, depot_idx=0):
 def solve_tsp_within_cluster(cluster_df, depot_coords):
     """
     클러스터 내 TSP 최적화 (OR-Tools 사용)
-    - depot에서 출발하여 클러스터 내 모든 지점 방문 후 depot 복귀
     """
     if len(cluster_df) == 0:
         return []
@@ -102,12 +205,20 @@ def solve_tsp_within_cluster(cluster_df, depot_coords):
         return [cluster_df.iloc[0]['id']]
     
     # depot을 임시로 추가 (인덱스 0)
-    temp_df = pd.DataFrame([{
+    temp_data = [{
         'id': '__depot__',
         'lat': depot_coords[0],
         'lon': depot_coords[1]
-    }])
-    temp_df = pd.concat([temp_df, cluster_df[['id', 'lat', 'lon']].reset_index(drop=True)], ignore_index=True)
+    }]
+    
+    for _, row in cluster_df.iterrows():
+        temp_data.append({
+            'id': row['id'],
+            'lat': row['lat'],
+            'lon': row['lon']
+        })
+    
+    temp_df = pd.DataFrame(temp_data)
     
     # 거리 행렬 생성
     dist_matrix = create_distance_matrix(temp_df)
@@ -135,7 +246,7 @@ def solve_tsp_within_cluster(cluster_df, depot_coords):
     solution = routing.SolveWithParameters(search_parameters)
     
     if not solution:
-        # 풀이 실패 시 Nearest Neighbor 휴리스틱
+        # 풀이 실패 시 Nearest Neighbor
         return nearest_neighbor_order(cluster_df, depot_coords)
     
     # 결과 추출 (depot 제외)
@@ -162,7 +273,6 @@ def nearest_neighbor_order(cluster_df, depot_coords):
     visited = [False] * n
     order = []
     
-    # depot에서 가장 가까운 점부터 시작
     current_lat, current_lon = depot_coords
     
     for _ in range(n):
@@ -186,18 +296,21 @@ def nearest_neighbor_order(cluster_df, depot_coords):
 
 @app.get("/")
 def read_root():
-    return {"status": "active", "message": "VRP Engine V5 (Sector Clustering + TSP)"}
+    return {"status": "active", "message": "VRP Engine V6 (K-Means Geo Clustering)"}
 
 
 @app.post("/optimize")
 def optimize_routes(body: RequestBody):
     """
     2단계 최적화:
-    1) 방위각 기반 섹터 클러스터링 → 구역 분리
+    1) K-Means 지리적 클러스터링 → 가까운 점끼리 묶임
     2) 각 클러스터 내 TSP 최적화 → 동선 최적화
+    
+    ★ 미배정 0건 보장
     """
     # 1. 데이터 준비
     df = pd.DataFrame([loc.dict() for loc in body.locations])
+    df = df.reset_index(drop=True)  # 인덱스 정리
     
     if len(df) < 2:
         return {"status": "error", "message": "Not enough locations"}
@@ -205,8 +318,27 @@ def optimize_routes(body: RequestBody):
     num_vehicles = body.num_vehicles
     depot_coords = (df.iloc[0]['lat'], df.iloc[0]['lon'])
     
-    # 2. 섹터 클러스터링 (방위각 기반)
-    df = create_sector_clusters(df, num_vehicles, depot_idx=0)
+    # 2. K-Means 지리적 클러스터링
+    df = create_geo_clusters(df, num_vehicles, depot_idx=0)
+    
+    # ★ 미배정 체크 및 강제 할당
+    unassigned = df[(df['cluster'] == -1) & (df.index != 0)]
+    if len(unassigned) > 0:
+        # 미배정 점들을 가장 가까운 클러스터에 강제 할당
+        for idx, row in unassigned.iterrows():
+            min_dist = float('inf')
+            best_cluster = 0
+            
+            for c in range(num_vehicles):
+                cluster_points = df[df['cluster'] == c][['lat', 'lon']].values
+                if len(cluster_points) > 0:
+                    centroid = cluster_points.mean(axis=0)
+                    dist = haversine(row['lat'], row['lon'], centroid[0], centroid[1])
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_cluster = c
+            
+            df.loc[idx, 'cluster'] = best_cluster
     
     # 3. 각 클러스터별 TSP 최적화
     results = []
@@ -238,9 +370,11 @@ def optimize_routes(body: RequestBody):
         prev_lat, prev_lon = depot_coords
         
         for node_id in optimized_order:
-            node_data = cluster_df[cluster_df['id'] == node_id].iloc[0]
-            total_distance += haversine(prev_lat, prev_lon, node_data['lat'], node_data['lon'])
-            prev_lat, prev_lon = node_data['lat'], node_data['lon']
+            node_row = cluster_df[cluster_df['id'] == node_id]
+            if len(node_row) > 0:
+                node_data = node_row.iloc[0]
+                total_distance += haversine(prev_lat, prev_lon, node_data['lat'], node_data['lon'])
+                prev_lat, prev_lon = node_data['lat'], node_data['lon']
         
         # depot 복귀 거리 추가
         total_distance += haversine(prev_lat, prev_lon, depot_coords[0], depot_coords[1])
@@ -251,140 +385,17 @@ def optimize_routes(body: RequestBody):
             "distance_km": round(total_distance, 2)
         })
     
-    return {
-        "status": "success",
-        "updates": results,
-        "statistics": stats,
-        "total_assigned": len(results),
-        "total_locations": len(df) - 1  # depot 제외
-    }
-
-
-@app.post("/optimize_v2")
-def optimize_routes_v2(body: RequestBody):
-    """
-    대안: OR-Tools 단일 VRP (제약조건 강화 버전)
-    - 모든 차량 강제 사용
-    - 구역 분리 강화
-    """
-    # 1. 데이터 준비
-    df = pd.DataFrame([loc.dict() for loc in body.locations])
-    
-    if len(df) < 2:
-        return {"status": "error", "message": "Not enough locations"}
-    
-    num_vehicles = body.num_vehicles
-    num_locations = len(df)
-    
-    # 2. 거리 행렬 생성
-    dist_matrix = create_distance_matrix(df)
-    
-    # 3. OR-Tools 설정
-    manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, 0)
-    routing = pywrapcp.RoutingModel(manager)
-    
-    # [비용] 거리 비용
-    def distance_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return int(dist_matrix[from_node][to_node])
-    
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-    
-    # [제약 1] 미배정 절대 방지 - 인덱스 정확히 처리
-    penalty = 100000000000  # 1000억
-    for node_index in range(1, num_locations):
-        index = manager.NodeToIndex(node_index)
-        if index >= 0:  # 유효한 인덱스만
-            routing.AddDisjunction([index], penalty)
-    
-    # [제약 2] 건수 균등화 + 모든 차량 사용 강제
-    def count_callback(from_index):
-        return 1
-    
-    count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
-    routing.AddDimension(count_callback_index, 0, 200, True, 'Count')
-    count_dimension = routing.GetDimensionOrDie('Count')
-    
-    # 평균 건수 계산 (depot 제외)
-    avg_count = (num_locations - 1) / num_vehicles
-    min_count = max(1, int(avg_count * 0.5))  # 최소: 평균의 50%
-    max_count = int(avg_count * 1.5) + 1      # 최대: 평균의 150%
-    
-    for i in range(num_vehicles):
-        end_index = routing.End(i)
-        # Hard constraint: 최소 건수 강제
-        routing.solver().Add(count_dimension.CumulVar(end_index) >= min_count)
-        # Soft constraint: 최대 건수 초과 시 벌점
-        count_dimension.SetCumulVarSoftUpperBound(end_index, max_count, 10000000)
-    
-    # 건수 격차 최소화
-    count_dimension.SetGlobalSpanCostCoefficient(100000)
-    
-    # [제약 3] 거리 균등화 (구역 분리 유도)
-    routing.AddDimension(
-        transit_callback_index,
-        0,
-        1000000,  # 최대 이동 거리 (1000km)
-        True,
-        'Distance'
-    )
-    dist_dimension = routing.GetDimensionOrDie('Distance')
-    dist_dimension.SetGlobalSpanCostCoefficient(50000)  # 강화
-    
-    # 4. 검색 전략
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
-    search_parameters.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
-    search_parameters.time_limit.seconds = 60
-    
-    solution = routing.SolveWithParameters(search_parameters)
-    
-    # 5. 결과 반환
-    if not solution:
-        return {"status": "fail", "message": "Solution not found"}
-    
-    results = []
-    stats = []
-    
-    for vehicle_id in range(num_vehicles):
-        route = []
-        total_distance = 0
-        index = routing.Start(vehicle_id)
-        prev_node = 0
-        
-        while not routing.IsEnd(index):
-            node_index = manager.IndexToNode(index)
-            if node_index != 0:
-                route.append(df.iloc[node_index]['id'])
-                total_distance += dist_matrix[prev_node][node_index]
-                prev_node = node_index
-            index = solution.Value(routing.NextVar(index))
-        
-        # depot 복귀 거리
-        total_distance += dist_matrix[prev_node][0]
-        
-        for node_id in route:
-            results.append({
-                "id": node_id,
-                "driver": f"기사 {vehicle_id + 1}"
-            })
-        
-        stats.append({
-            "driver": f"기사 {vehicle_id + 1}",
-            "count": len(route),
-            "distance_km": round(total_distance / 1000, 2)
-        })
+    # 4. 최종 검증
+    total_assigned = len(results)
+    total_locations = len(df) - 1  # depot 제외
     
     return {
         "status": "success",
         "updates": results,
         "statistics": stats,
-        "total_assigned": len(results),
-        "total_locations": num_locations - 1
+        "total_assigned": total_assigned,
+        "total_locations": total_locations,
+        "unassigned": total_locations - total_assigned  # 항상 0이어야 함
     }
 
 
