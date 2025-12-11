@@ -61,7 +61,7 @@ def optimize_routes(body: RequestBody):
         return 1
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
     routing.AddDimension(count_callback_index, 0, 100, True, 'Count')
-    routing.GetDimensionOrDie('Count').SetGlobalSpanCostCoefficient(500000)
+    routing.GetDimensionOrDie('Count').SetGlobalSpanCostCoefficient(500)
 
     # 균등 배분 (무게) - 2순위
     weights = df['weight'].tolist()
