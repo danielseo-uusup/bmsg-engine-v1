@@ -53,23 +53,24 @@ def optimize_routes(body: RequestBody):
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # [핵심 1] 미배정 방지 (모든 노드에 강력한 방문 의무 부여)
-    # 방문 안 할 경우 패널티 1,000,000,000점 -> 무조건 방문하게 됨
+    # [핵심 1] 미배정 절대 방지 (Penalty: 10억 점)
+    # 거리가 아무리 멀어도 배정 안 하는 것보다 배정하는 게 이득이게 만듦
     for node_index in range(1, len(df)):
         routing.AddDisjunction([manager.NodeToIndex(node_index)], 1000000000)
 
-    # [핵심 2] 건수 균등 배분 (Count Dimension)
+    # [핵심 2] 클러스터링 강화 (Count Dimension)
     def count_callback(from_index):
         return 1
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
     
-    # 넉넉하게 인당 최대 100건까지 가능하게 설정 (제약으로 실패하지 않도록)
-    routing.AddDimension(count_callback_index, 0, 200, True, 'Count')
+    # 인당 최대 100건까지 가능 (유연하게)
+    routing.AddDimension(count_callback_index, 0, 100, True, 'Count')
     count_dimension = routing.GetDimensionOrDie('Count')
     
-    # "가장 많이 한 사람"과 "가장 적게 한 사람"의 차이를 줄이는 데 100,000배 가중치
-    # 이 값이 높을수록 거리가 좀 멀어져도 개수를 맞추려고 노력함
-    count_dimension.SetGlobalSpanCostCoefficient(100000)
+    # ★★★ 여기를 수정했습니다 ★★★
+    # 기존: 100,000 (무조건 똑같이 나눠라 -> 동선 꼬임)
+    # 변경: 2,500 (적당히 비슷하게 나누되, 동선 효율을 더 챙겨라 -> 클러스터링)
+    count_dimension.SetGlobalSpanCostCoefficient(2500)
 
     # 무게 균등 배분 (보조)
     weights = df['weight'].tolist()
@@ -82,10 +83,10 @@ def optimize_routes(body: RequestBody):
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     
-    # [핵심 3] 계산 시간 30초로 연장 (데이터가 많아졌으므로 필수)
+    # [핵심 3] 계산 시간 30초로 대폭 연장 (복잡한 꼬임을 풀 시간 확보)
     search_parameters.time_limit.seconds = 30
     
-    # 지역 최적해에 빠지지 않도록 탐색 알고리즘 강화
+    # 지역 최적해 탈출 알고리즘 (Guided Local Search)
     search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
 
     solution = routing.SolveWithParameters(search_parameters)
