@@ -56,12 +56,23 @@ def optimize_routes(body: RequestBody):
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # 균등 배분 (건수)
+    # 균등 배분 (건수) 설정
     def count_callback(from_index):
         return 1
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
     routing.AddDimension(count_callback_index, 0, 100, True, 'Count')
-    routing.GetDimensionOrDie('Count').SetGlobalSpanCostCoefficient(500)
+    
+    # Count 차원 가져오기
+    count_dimension = routing.GetDimensionOrDie('Count')
+    
+    # [설정 1] 기사 간 업무량 격차 줄이기 (5000점)
+    count_dimension.SetGlobalSpanCostCoefficient(5000)
+
+    # [설정 2] ★★★ 최소 업무량 강제 (여기에 추가됨) ★★★
+    # 모든 차량에 대해 최소 2포인트(차고지 1 + 업무 1) 이상 방문하도록 설정
+    # 이를 어길 시 100,000점의 벌점을 부여하여 강제로 방문하게 함
+    for i in range(body.num_vehicles):
+        count_dimension.SetCumulVarSoftLowerBound(i, 2, 100000)
 
     # 균등 배분 (무게) - 2순위
     weights = df['weight'].tolist()
