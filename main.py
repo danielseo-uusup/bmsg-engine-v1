@@ -21,7 +21,7 @@ class RequestBody(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"status": "active", "message": "VRP Engine V3 (Clustering Optimized)"}
+    return {"status": "active", "message": "VRP Engine V4 (Parallel Clustering)"}
 
 @app.post("/optimize")
 def optimize_routes(body: RequestBody):
@@ -43,25 +43,25 @@ def optimize_routes(body: RequestBody):
         return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
     coords = df[['lat', 'lon']].values
-    # 거리에 가중치를 주어 멀리 있는 점을 더 비싸게 인식시킴
+    # 거리에 가중치(1000)를 곱해 미터 단위로 변환
     dist_matrix = squareform(pdist(coords, lambda u, v: haversine_vectorized(u[0], u[1], v[0], v[1]))) * 1000
 
     # 3. OR-Tools 설정
     manager = pywrapcp.RoutingIndexManager(len(df), num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
 
-    # [비용] 거리 비용
+    # [비용 1] 거리 비용
     def distance_callback(from_index, to_index):
         return int(dist_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # [핵심 1] 미배정 절대 방지 (Penalty: 100억 점)
-    # 어떤 이유로든 배정 안 하면 계산 자체가 망가지도록 설정
+    # [제약 1] 미배정 절대 방지 (Penalty: 1000억 점)
+    # 지구 끝까지 가는 비용보다 미배정 벌점이 더 커야 함 -> 무조건 방문
     for node_index in range(1, len(df)):
-        routing.AddDisjunction([manager.NodeToIndex(node_index)], 10000000000)
+        routing.AddDisjunction([manager.NodeToIndex(node_index)], 100000000000)
 
-    # [핵심 2] 4명 강제 투입 (최소 업무량 설정)
+    # [제약 2] 4명 강제 투입 & 건수 균등화
     def count_callback(from_index):
         return 1
     count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
@@ -69,40 +69,42 @@ def optimize_routes(body: RequestBody):
     routing.AddDimension(count_callback_index, 0, 200, True, 'Count')
     count_dimension = routing.GetDimensionOrDie('Count')
     
-    # 총 건수를 차량 수로 나눈 뒤, 그 70% 정도는 무조건 하도록 강제
-    # 예: 80건 / 4명 = 20건 -> 최소 14건은 해야 함.
-    # (차고지 노드 1개가 포함되므로 실제 업무량은 min_count - 1)
-    total_orders = len(df) - 1 # 차고지 제외
-    min_count = int((total_orders / num_vehicles) * 0.7) 
+    # (A) 최소 업무량 강제: 전체 건수의 10% 이상은 무조건 해야 함
+    # 예: 80건이면 최소 8건은 해야 함. 안 하면 벌점 1억 점.
+    min_count_per_vehicle = int((len(df) - 1) / num_vehicles * 0.5) # 평균의 50%
+    if min_count_per_vehicle < 1: min_count_per_vehicle = 1
     
-    # 모든 차량에 최소 업무량 강제 (Soft Lower Bound)
-    # 이걸 어기면 벌점 100만점 -> 2명만 일하는 게 불가능해짐
     for i in range(num_vehicles):
-        count_dimension.SetCumulVarSoftLowerBound(i, min_count + 1, 1000000)
+        # SetCumulVarSoftLowerBound(차량번호, 최소값, 미달시벌점)
+        count_dimension.SetCumulVarSoftLowerBound(i, min_count_per_vehicle, 100000000)
 
-    # [핵심 3] 클러스터링 유도 (최대 거리 제한)
-    # 한 기사가 너무 멀리(지구 끝에서 끝) 이동하지 못하게 막음
+    # (B) 최대 격차 줄이기: 1등과 꼴등의 건수 차이를 줄임
+    count_dimension.SetGlobalSpanCostCoefficient(5000)
+
+    # [제약 3] 이동 거리 균등화 (클러스터링 유도)
+    # 한 명이 너무 멀리(넓게) 다니지 못하게 막음 -> 구역이 뭉치게 됨
     routing.AddDimension(
         transit_callback_index,
         0,  # slack
-        300000, # 차량당 최대 이동 거리 (300km)
+        500000, # 최대 이동 거리 (넉넉하게)
         True,  # start cumul to zero
         'Distance'
     )
     dist_dimension = routing.GetDimensionOrDie('Distance')
-    # 기사들 간의 이동 거리 격차를 줄임 -> 비슷한 크기의 구역을 맡게 됨
-    dist_dimension.SetGlobalSpanCostCoefficient(100)
+    # 기사들 간의 총 이동 거리 차이를 줄임 -> 비슷한 반경의 구역을 맡게 됨
+    dist_dimension.SetGlobalSpanCostCoefficient(5000)
 
-    # 4. 풀이 전략 설정 (여기가 "침팬지" 탈출 열쇠)
+    # 4. 풀이 전략 설정 (여기가 핵심!)
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     
     # ★ PARALLEL_CHEAPEST_INSERTION: 
-    # 차고지에서 꽃잎처럼 동시에 퍼져나가며 경로를 만듭니다. (군집화에 유리)
+    # 차고지에서 4명이 동시에 뻗어나가며 가장 싼 곳을 먹는 방식. 
+    # 이 전략이 "꽃잎 모양" 구역 나누기에 가장 효과적임.
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
     
     # ★ GUIDED_LOCAL_SEARCH:
-    # 꼬인 선을 푸는 후처리 알고리즘
+    # 꼬인 선을 풀고 최적해를 찾아가는 후처리 (필수)
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
     
@@ -113,7 +115,6 @@ def optimize_routes(body: RequestBody):
 
     # 5. 결과 반환
     if not solution:
-        # 실패 시 로그를 위해 
         return {"status": "fail", "message": "Solution not found"}
 
     results = []
