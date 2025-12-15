@@ -49,308 +49,245 @@ def haversine(lat1, lon1, lat2, lon2):
     return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
 
-def spatial_quadrant_partition(df, num_sectors, depot_idx=0):
+def voronoi_partition(df, drivers, depot_idx=0):
     """
-    ★ V11.1 핵심: 공간을 명확한 선으로 분할 ★
-    
-    방법: Recursive Bisection (재귀적 이등분)
-    1. 전체 영역을 위도 또는 경도 기준으로 이등분
-    2. 각 영역을 다시 이등분
-    3. num_sectors개의 영역이 될 때까지 반복
-    
-    결과: 겹치지 않는 명확한 경계의 섹터들
-    """
-    
-    print("\n=== 1단계: 공간 분할 (Recursive Bisection) ===")
-    
-    # 노드 정보 추출 (depot 제외)
-    nodes = []
-    for i in range(len(df)):
-        if i == depot_idx:
-            continue
-        nodes.append({
-            'idx': i,
-            'lat': float(df.iloc[i]['lat']),
-            'lon': float(df.iloc[i]['lon']),
-            'weight': int(df.iloc[i]['weight'])
-        })
-    
-    if not nodes:
-        return {}, []
-    
-    # 재귀적 이등분으로 섹터 생성
-    sectors = recursive_bisection(nodes, num_sectors)
-    
-    # 결과 정리
-    sector_assignments = {}  # {node_idx: sector_id}
-    sector_nodes = {i: [] for i in range(len(sectors))}
-    
-    for sector_id, sector in enumerate(sectors):
-        for node in sector:
-            sector_assignments[node['idx']] = sector_id
-            sector_nodes[sector_id].append(node['idx'])
-        print(f"  섹터 {sector_id}: {len(sector)}개 노드")
-    
-    return sector_assignments, sector_nodes, sectors
-
-
-def recursive_bisection(nodes, num_sectors):
-    """
-    재귀적 이등분 알고리즘
-    
-    1. 노드들의 분포를 보고 위도/경도 중 더 넓은 축으로 분할
-    2. 중앙값 기준으로 이등분
-    3. 원하는 섹터 수가 될 때까지 반복
-    """
-    
-    if num_sectors <= 1 or len(nodes) == 0:
-        return [nodes]
-    
-    if len(nodes) <= 1:
-        return [nodes]
-    
-    # 위도/경도 범위 계산
-    lats = [n['lat'] for n in nodes]
-    lons = [n['lon'] for n in nodes]
-    
-    lat_range = max(lats) - min(lats)
-    lon_range = max(lons) - min(lons)
-    
-    # 더 넓은 축으로 분할
-    if lat_range >= lon_range:
-        # 위도 기준 분할 (남북)
-        sorted_nodes = sorted(nodes, key=lambda n: n['lat'])
-        split_axis = 'lat'
-    else:
-        # 경도 기준 분할 (동서)
-        sorted_nodes = sorted(nodes, key=lambda n: n['lon'])
-        split_axis = 'lon'
-    
-    # 중앙에서 분할
-    mid = len(sorted_nodes) // 2
-    left_nodes = sorted_nodes[:mid]
-    right_nodes = sorted_nodes[mid:]
-    
-    # 각 반쪽에 할당할 섹터 수
-    left_sectors = num_sectors // 2
-    right_sectors = num_sectors - left_sectors
-    
-    # 재귀 호출
-    left_result = recursive_bisection(left_nodes, left_sectors)
-    right_result = recursive_bisection(right_nodes, right_sectors)
-    
-    return left_result + right_result
-
-
-def match_sectors_to_drivers(sector_nodes, drivers, df, depot_idx=0):
-    """
-    ★ V11.1: 섹터-기사 최적 매칭 ★
+    ★ V11.2 핵심: 거점 기반 Voronoi 분할 ★
     
     원칙:
-    1. 섹터의 노드 수와 기사의 max_capa를 매칭
-    2. 큰 섹터 → max_capa 큰 기사
-    3. 기사 거점과 섹터 중심 거리도 고려
+    1. 각 노드를 "가장 가까운 기사 거점"에 배정
+    2. 자연스럽게 영역이 분리됨 (Voronoi 특성)
+    3. 기사들의 영역이 서로 겹치지 않음
     
-    알고리즘: Hungarian Algorithm 대신 Greedy 매칭 (단순화)
+    결과: 각 기사의 거점 주변으로 클러스터 형성
     """
     
-    print("\n=== 2단계: 섹터-기사 매칭 ===")
+    print("\n=== 1단계: 거점 기반 Voronoi 분할 ===")
     
-    num_sectors = len(sector_nodes)
-    num_drivers = len(drivers)
-    
-    # 섹터 정보
-    sector_info = []
-    for sector_id, nodes in sector_nodes.items():
-        if not nodes:
-            center_lat, center_lon = 0, 0
-        else:
-            center_lat = np.mean([float(df.iloc[idx]['lat']) for idx in nodes])
-            center_lon = np.mean([float(df.iloc[idx]['lon']) for idx in nodes])
-        
-        sector_info.append({
-            'sector_id': sector_id,
-            'node_count': len(nodes),
-            'center_lat': center_lat,
-            'center_lon': center_lon
-        })
-    
-    # 기사 정보
-    driver_info = []
+    # 기사 거점 정보
+    driver_bases = []
     for i, driver in enumerate(drivers):
         max_capa = driver.max_capa if driver.max_capa else DEFAULT_MAX_CAPA
-        base_lat = driver.base_lat if driver.base_lat else float(df.iloc[depot_idx]['lat'])
-        base_lng = driver.base_lng if driver.base_lng else float(df.iloc[depot_idx]['lon'])
         
-        driver_info.append({
+        if driver.base_lat is not None and driver.base_lng is not None:
+            base_lat, base_lng = driver.base_lat, driver.base_lng
+        else:
+            # 거점 없으면 depot 사용
+            base_lat = float(df.iloc[depot_idx]['lat'])
+            base_lng = float(df.iloc[depot_idx]['lon'])
+        
+        driver_bases.append({
             'driver_idx': i,
             'driver': driver,
             'max_capa': max_capa,
             'base_lat': base_lat,
             'base_lng': base_lng
         })
-    
-    # 섹터를 노드 수 내림차순 정렬
-    sector_info.sort(key=lambda x: -x['node_count'])
-    
-    # 기사를 max_capa 내림차순 정렬
-    driver_info.sort(key=lambda x: -x['max_capa'])
-    
-    print(f"  섹터 (노드 수 순): {[s['node_count'] for s in sector_info]}")
-    print(f"  기사 (max_capa 순): {[d['max_capa'] for d in driver_info]}")
-    
-    # Greedy 매칭: 큰 섹터 → 큰 기사
-    sector_to_driver = {}
-    used_drivers = set()
-    
-    for s_info in sector_info:
-        sector_id = s_info['sector_id']
-        node_count = s_info['node_count']
         
-        # 아직 매칭 안 된 기사 중 선택
-        best_driver = None
-        best_score = float('inf')
-        
-        for d_info in driver_info:
-            if d_info['driver_idx'] in used_drivers:
-                continue
-            
-            # 점수: |섹터 크기 - max_capa| + 거점 거리 가중치
-            size_diff = abs(node_count - d_info['max_capa'])
-            
-            # 거점-섹터 중심 거리
-            dist = haversine(
-                s_info['center_lat'], s_info['center_lon'],
-                d_info['base_lat'], d_info['base_lng']
-            )
-            
-            # 종합 점수 (size_diff 우선, 거리는 보조)
-            score = size_diff * 100 + dist
-            
-            if score < best_score:
-                best_score = score
-                best_driver = d_info
-        
-        if best_driver:
-            sector_to_driver[sector_id] = best_driver['driver_idx']
-            used_drivers.add(best_driver['driver_idx'])
-            print(f"  섹터 {sector_id} ({node_count}건) → {best_driver['driver'].name} (max_capa={best_driver['max_capa']})")
+        print(f"  {driver.name}: 거점=({base_lat:.4f}, {base_lng:.4f}), max_capa={max_capa}")
     
-    return sector_to_driver, driver_info
+    # 각 노드를 가장 가까운 거점에 배정 (순수 Voronoi)
+    node_assignments = {}  # {node_idx: driver_idx}
+    driver_nodes = {i: [] for i in range(len(drivers))}
+    
+    for i in range(len(df)):
+        if i == depot_idx:
+            continue
+        
+        node_lat = float(df.iloc[i]['lat'])
+        node_lon = float(df.iloc[i]['lon'])
+        
+        # 가장 가까운 거점 찾기
+        min_dist = float('inf')
+        nearest_driver = 0
+        
+        for d_info in driver_bases:
+            dist = haversine(node_lat, node_lon, d_info['base_lat'], d_info['base_lng'])
+            if dist < min_dist:
+                min_dist = dist
+                nearest_driver = d_info['driver_idx']
+        
+        node_assignments[i] = nearest_driver
+        driver_nodes[nearest_driver].append(i)
+    
+    # Voronoi 결과 출력
+    print(f"\n  Voronoi 분할 결과:")
+    for d_info in driver_bases:
+        driver_idx = d_info['driver_idx']
+        count = len(driver_nodes[driver_idx])
+        print(f"    {d_info['driver'].name}: {count}건 (max_capa={d_info['max_capa']})")
+    
+    return node_assignments, driver_nodes, driver_bases
 
 
-def balance_sectors_by_capacity(sector_nodes, sector_to_driver, driver_info, df, depot_idx=0):
+def balance_by_max_capa(df, driver_nodes, driver_bases, depot_idx=0):
     """
-    ★ V11.1: 섹터 경계 조정 (max_capa 초과 시) ★
+    ★ V11.2: max_capa 기반 밸런싱 ★
     
-    원칙:
-    - 섹터 노드 수 > 기사 max_capa면 경계 노드를 인접 섹터로 이동
-    - 이동 시에도 "선 안쪽"에 있어야 함 (교차 방지)
+    Voronoi 분할 후 max_capa를 초과하는 기사가 있으면:
+    1. 초과 기사의 "경계 노드" (거점에서 가장 먼 노드)를 찾음
+    2. 해당 노드와 가장 가까운 "여유 있는" 기사에게 이전
+    3. 모든 기사가 max_capa 이하가 될 때까지 반복
     
-    방법:
-    - 초과 섹터의 가장 경계에 있는 노드(섹터 중심에서 가장 먼 노드)를
-    - 인접 섹터 중 여유 있는 곳으로 이동
+    핵심: 이전 시 "거리 기준"으로 자연스러운 경계 유지
     """
     
-    print("\n=== 3단계: 섹터 경계 조정 (max_capa 맞춤) ===")
+    print("\n=== 2단계: max_capa 기반 밸런싱 ===")
     
     # 현재 상태 복사
-    balanced_sectors = {k: list(v) for k, v in sector_nodes.items()}
+    balanced_nodes = {k: list(v) for k, v in driver_nodes.items()}
     
     # 기사별 max_capa 매핑
-    driver_max_capa = {}
-    for d_info in driver_info:
-        driver_max_capa[d_info['driver_idx']] = d_info['max_capa']
+    driver_max_capa = {d['driver_idx']: d['max_capa'] for d in driver_bases}
+    driver_bases_map = {d['driver_idx']: d for d in driver_bases}
     
-    # 섹터별 중심점 계산
-    def get_sector_center(nodes):
-        if not nodes:
-            return (0, 0)
-        lats = [float(df.iloc[idx]['lat']) for idx in nodes]
-        lons = [float(df.iloc[idx]['lon']) for idx in nodes]
-        return (np.mean(lats), np.mean(lons))
+    max_iterations = 100
+    total_moved = 0
     
-    # 반복적으로 조정
-    max_iterations = 50
     for iteration in range(max_iterations):
-        moved = False
+        moved_this_round = False
         
-        for sector_id, nodes in balanced_sectors.items():
-            if sector_id not in sector_to_driver:
-                continue
-            
-            driver_idx = sector_to_driver[sector_id]
+        # 초과 기사 찾기
+        for driver_idx, nodes in balanced_nodes.items():
             max_capa = driver_max_capa[driver_idx]
-            
-            # 초과 확인
             excess = len(nodes) - max_capa
+            
             if excess <= 0:
                 continue
             
-            # 섹터 중심
-            center = get_sector_center(nodes)
+            # 거점 정보
+            d_info = driver_bases_map[driver_idx]
+            base_lat, base_lng = d_info['base_lat'], d_info['base_lng']
             
-            # 중심에서 가장 먼 노드들 (경계 노드)
+            # 거점에서 가장 먼 노드 (경계 노드)
             nodes_with_dist = []
             for node_idx in nodes:
                 node_lat = float(df.iloc[node_idx]['lat'])
                 node_lon = float(df.iloc[node_idx]['lon'])
-                dist = haversine(center[0], center[1], node_lat, node_lon)
-                nodes_with_dist.append((node_idx, dist))
+                dist = haversine(base_lat, base_lng, node_lat, node_lon)
+                nodes_with_dist.append((node_idx, dist, node_lat, node_lon))
             
-            nodes_with_dist.sort(key=lambda x: -x[1])  # 거리 내림차순
+            nodes_with_dist.sort(key=lambda x: -x[1])  # 거리 내림차순 (먼 것부터)
             
-            # 초과분만큼 이동 시도
-            for node_idx, _ in nodes_with_dist[:excess]:
-                node_lat = float(df.iloc[node_idx]['lat'])
-                node_lon = float(df.iloc[node_idx]['lon'])
-                
-                # 인접 섹터 중 여유 있는 곳 찾기
+            # 초과분만큼 이전 시도
+            for node_idx, _, node_lat, node_lon in nodes_with_dist[:excess]:
+                # 여유 있는 기사 중 해당 노드와 가장 가까운 거점 찾기
                 best_target = None
                 best_dist = float('inf')
                 
-                for other_sector_id, other_nodes in balanced_sectors.items():
-                    if other_sector_id == sector_id:
+                for other_idx, other_nodes in balanced_nodes.items():
+                    if other_idx == driver_idx:
                         continue
                     
-                    if other_sector_id not in sector_to_driver:
-                        continue
-                    
-                    other_driver_idx = sector_to_driver[other_sector_id]
-                    other_max_capa = driver_max_capa[other_driver_idx]
+                    other_max_capa = driver_max_capa[other_idx]
                     
                     # 여유 있는지 확인
                     if len(other_nodes) >= other_max_capa:
                         continue
                     
-                    # 해당 섹터 중심과의 거리
-                    other_center = get_sector_center(other_nodes)
-                    dist_to_other = haversine(node_lat, node_lon, other_center[0], other_center[1])
+                    # 해당 기사 거점과의 거리
+                    other_info = driver_bases_map[other_idx]
+                    dist_to_other = haversine(node_lat, node_lon, 
+                                             other_info['base_lat'], other_info['base_lng'])
                     
                     if dist_to_other < best_dist:
                         best_dist = dist_to_other
-                        best_target = other_sector_id
+                        best_target = other_idx
                 
-                # 이동
+                # 이전 실행
                 if best_target is not None:
-                    balanced_sectors[sector_id].remove(node_idx)
-                    balanced_sectors[best_target].append(node_idx)
-                    moved = True
-                    print(f"  노드 {node_idx}: 섹터 {sector_id} → 섹터 {best_target}")
+                    balanced_nodes[driver_idx].remove(node_idx)
+                    balanced_nodes[best_target].append(node_idx)
+                    moved_this_round = True
+                    total_moved += 1
+                    
+                    from_name = driver_bases_map[driver_idx]['driver'].name
+                    to_name = driver_bases_map[best_target]['driver'].name
+                    print(f"  노드 {node_idx}: {from_name} → {to_name}")
         
-        if not moved:
+        if not moved_this_round:
             break
     
-    # 최종 상태 출력
-    print(f"\n  조정 후 섹터별 노드 수:")
-    for sector_id, nodes in balanced_sectors.items():
-        if sector_id in sector_to_driver:
-            driver_idx = sector_to_driver[sector_id]
-            max_capa = driver_max_capa[driver_idx]
-            status = "✅" if len(nodes) <= max_capa else "❌"
-            print(f"    섹터 {sector_id}: {len(nodes)}건 (max_capa={max_capa}) {status}")
+    print(f"\n  총 {total_moved}개 노드 이전")
     
-    return balanced_sectors
+    # 최종 상태 출력
+    print(f"\n  밸런싱 후 결과:")
+    for d_info in driver_bases:
+        driver_idx = d_info['driver_idx']
+        count = len(balanced_nodes[driver_idx])
+        max_capa = d_info['max_capa']
+        status = "✅" if count <= max_capa else "❌ 초과"
+        print(f"    {d_info['driver'].name}: {count}건 / max_capa={max_capa} {status}")
+    
+    return balanced_nodes
+
+
+def handle_overflow(df, balanced_nodes, driver_bases, depot_idx=0):
+    """
+    ★ V11.2: 전체 초과분 처리 ★
+    
+    총 노드 수 > 총 max_capa 합계인 경우:
+    1. 모든 기사가 max_capa까지 채움
+    2. 나머지는 미배정으로 처리
+    
+    미배정 기준: 모든 거점에서 가장 먼 노드들
+    """
+    
+    print("\n=== 3단계: 초과분 처리 ===")
+    
+    total_max_capa = sum(d['max_capa'] for d in driver_bases)
+    total_nodes = sum(len(nodes) for nodes in balanced_nodes.values())
+    
+    overflow = total_nodes - total_max_capa
+    
+    if overflow <= 0:
+        print(f"  초과 없음 (총 {total_nodes}건 / 수용량 {total_max_capa}건)")
+        return balanced_nodes, []
+    
+    print(f"  초과 발생: {overflow}건 미배정 필요")
+    
+    # 모든 노드에 대해 "가장 가까운 거점까지의 거리" 계산
+    all_nodes = []
+    for driver_idx, nodes in balanced_nodes.items():
+        d_info = next(d for d in driver_bases if d['driver_idx'] == driver_idx)
+        
+        for node_idx in nodes:
+            node_lat = float(df.iloc[node_idx]['lat'])
+            node_lon = float(df.iloc[node_idx]['lon'])
+            
+            # 가장 가까운 거점과의 거리
+            min_dist = min(
+                haversine(node_lat, node_lon, d['base_lat'], d['base_lng'])
+                for d in driver_bases
+            )
+            
+            all_nodes.append({
+                'node_idx': node_idx,
+                'driver_idx': driver_idx,
+                'min_dist': min_dist
+            })
+    
+    # 거리 내림차순 정렬 (가장 먼 노드부터)
+    all_nodes.sort(key=lambda x: -x['min_dist'])
+    
+    # 초과분 제거
+    unassigned = []
+    removed_count = 0
+    
+    for node_info in all_nodes:
+        if removed_count >= overflow:
+            break
+        
+        node_idx = node_info['node_idx']
+        driver_idx = node_info['driver_idx']
+        
+        if node_idx in balanced_nodes[driver_idx]:
+            balanced_nodes[driver_idx].remove(node_idx)
+            unassigned.append(node_idx)
+            removed_count += 1
+    
+    print(f"  {len(unassigned)}건 미배정 처리")
+    
+    return balanced_nodes, unassigned
 
 
 def optimize_visit_order_nearest_neighbor(df, node_indices, start_lat, start_lon):
@@ -359,7 +296,7 @@ def optimize_visit_order_nearest_neighbor(df, node_indices, start_lat, start_lon
         return []
     
     if len(node_indices) == 1:
-        return node_indices
+        return list(node_indices)
     
     visited = []
     remaining = set(node_indices)
@@ -400,33 +337,32 @@ def calculate_route_distance(df, visit_order, start_lat, start_lon):
 def read_root():
     return {
         "status": "active",
-        "message": "VRP Engine V11.1 (Spatial Partition First)",
+        "message": "VRP Engine V11.2 (Voronoi Partition by Driver Base)",
         "features": [
-            "★ 공간 분할 우선: 가상의 선으로 영역 구분",
-            "★ Recursive Bisection: 겹치지 않는 명확한 경계",
-            "★ max_capa 하드캡 100% 준수",
+            "★ 거점 기반 Voronoi 분할: 각 노드를 가장 가까운 거점에 배정",
+            "★ 자연스러운 영역 분리: 기사 영역이 서로 감싸지 않음",
+            "★ max_capa 기반 밸런싱: 초과 시 경계 노드 이전",
             "★ 클러스터 간 교차 0%",
-            "섹터-기사 최적 매칭 (크기 기반)",
-            "경계 조정으로 max_capa 맞춤"
+            "Nearest Neighbor 방문 순서 최적화"
         ],
-        "algorithm": "Recursive Bisection → Sector-Driver Matching → Boundary Adjustment"
+        "algorithm": "Voronoi Partition → max_capa Balancing → Nearest Neighbor TSP"
     }
 
 
 @app.post("/optimize")
 def optimize_routes(body: RequestBody):
     """
-    ★ V11.1: 공간 분할 우선 배차 최적화 ★
+    ★ V11.2: 거점 기반 Voronoi 분할 배차 최적화 ★
     
     핵심 원칙:
-    1. 먼저 공간을 명확한 선으로 분할 (교차 원천 차단)
-    2. 분할된 섹터를 기사 max_capa에 맞게 매칭
-    3. 필요 시 경계 조정
+    1. 각 노드를 "가장 가까운 기사 거점"에 배정 (Voronoi)
+    2. max_capa 초과 시 경계 노드를 인접 기사에게 이전
+    3. 기사 영역이 서로 감싸지 않음 (자연스러운 분리)
     
     알고리즘:
-    1. Recursive Bisection으로 N개 섹터 생성
-    2. 섹터 크기와 기사 max_capa 매칭
-    3. 초과 섹터의 경계 노드를 인접 섹터로 이동
+    1. Voronoi 분할: 노드 → 가장 가까운 거점
+    2. max_capa 밸런싱: 초과 노드 이전
+    3. 초과분 처리: 미배정
     4. Nearest Neighbor로 방문 순서 결정
     """
     
@@ -460,7 +396,7 @@ def optimize_routes(body: RequestBody):
         total_calls = num_locations - 1
         
         print(f"\n{'='*50}")
-        print(f"VRP V11.1 - Spatial Partition First")
+        print(f"VRP V11.2 - Voronoi Partition by Driver Base")
         print(f"{'='*50}")
         print(f"총 콜: {total_calls}건")
         print(f"총 수용량: {total_max_capa}건")
@@ -471,19 +407,19 @@ def optimize_routes(body: RequestBody):
             df['weight'] = DEFAULT_WEIGHT_KG
         df['weight'] = pd.to_numeric(df['weight'], errors='coerce').fillna(DEFAULT_WEIGHT_KG).astype(int)
         
-        # 2. 공간 분할 (Recursive Bisection)
-        sector_assignments, sector_nodes, sectors = spatial_quadrant_partition(
-            df, num_drivers, depot_idx
+        # 2. Voronoi 분할
+        node_assignments, driver_nodes, driver_bases = voronoi_partition(
+            df, drivers, depot_idx
         )
         
-        # 3. 섹터-기사 매칭
-        sector_to_driver, driver_info = match_sectors_to_drivers(
-            sector_nodes, drivers, df, depot_idx
+        # 3. max_capa 밸런싱
+        balanced_nodes = balance_by_max_capa(
+            df, driver_nodes, driver_bases, depot_idx
         )
         
-        # 4. 경계 조정 (max_capa 맞춤)
-        balanced_sectors = balance_sectors_by_capacity(
-            sector_nodes, sector_to_driver, driver_info, df, depot_idx
+        # 4. 초과분 처리
+        balanced_nodes, unassigned_nodes = handle_overflow(
+            df, balanced_nodes, driver_bases, depot_idx
         )
         
         # 5. 결과 생성
@@ -492,18 +428,11 @@ def optimize_routes(body: RequestBody):
         results = []
         stats = []
         total_distance = 0
-        unassigned_nodes = []
         
-        # 드라이버 인덱스 → 드라이버 정보 매핑
-        driver_info_map = {d['driver_idx']: d for d in driver_info}
+        driver_bases_map = {d['driver_idx']: d for d in driver_bases}
         
-        for sector_id, nodes in balanced_sectors.items():
-            if sector_id not in sector_to_driver:
-                unassigned_nodes.extend(nodes)
-                continue
-            
-            driver_idx = sector_to_driver[sector_id]
-            d_info = driver_info_map[driver_idx]
+        for driver_idx, nodes in balanced_nodes.items():
+            d_info = driver_bases_map[driver_idx]
             driver = d_info['driver']
             max_capa = d_info['max_capa']
             base_lat = d_info['base_lat']
@@ -590,13 +519,13 @@ def optimize_routes(body: RequestBody):
                 "avg_distance_km": round(total_distance / num_drivers, 2) if num_drivers > 0 else 0
             },
             "optimization_info": {
-                "algorithm": "V11.1: Recursive Bisection + Sector-Driver Matching",
+                "algorithm": "V11.2: Voronoi Partition + max_capa Balancing",
                 "max_capa_violations": len(violations),
                 "cluster_overlap": 0,
                 "principles": [
-                    "공간 분할 우선 (가상의 선)",
-                    "max_capa 하드캡 준수",
-                    "클러스터 간 교차 0%"
+                    "거점 기반 Voronoi 분할",
+                    "기사 영역 간 감싸기 없음",
+                    "max_capa 하드캡 준수"
                 ]
             }
         }
