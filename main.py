@@ -49,112 +49,96 @@ def haversine(lat1, lon1, lat2, lon2):
     return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
 
-def kmeans_clustering(coords, n_clusters, max_iter=100):
+def capacity_aware_bisection(nodes_data, capacities, depth=0):
     """
-    순수 numpy로 구현한 K-Means 클러스터링
-    sklearn 없이 동작
-    """
-    n_samples = len(coords)
-    
-    if n_samples <= n_clusters:
-        return list(range(n_samples))
-    
-    # 초기 중심점: 랜덤 선택
-    np.random.seed(42)
-    indices = np.random.choice(n_samples, n_clusters, replace=False)
-    centroids = coords[indices].copy()
-    
-    labels = np.zeros(n_samples, dtype=int)
-    
-    for _ in range(max_iter):
-        # 각 점을 가장 가까운 중심점에 할당
-        new_labels = np.zeros(n_samples, dtype=int)
-        for i in range(n_samples):
-            distances = [haversine(coords[i][0], coords[i][1], c[0], c[1]) for c in centroids]
-            new_labels[i] = np.argmin(distances)
-        
-        # 수렴 체크
-        if np.array_equal(labels, new_labels):
-            break
-        labels = new_labels
-        
-        # 중심점 업데이트
-        for k in range(n_clusters):
-            cluster_points = coords[labels == k]
-            if len(cluster_points) > 0:
-                centroids[k] = cluster_points.mean(axis=0)
-    
-    return labels.tolist(), centroids
-
-
-def geographic_clustering(df, n_clusters, depot_idx=0):
-    """
-    ★ V11.3 핵심: 노드 분포 기반 지리적 클러스터링 ★
+    ★ V11.4 핵심: Capacity-Aware Recursive Bisection ★
     
     원칙:
-    1. 기사 거점 무시, 오직 노드 위치만 고려
-    2. K-Means로 지리적으로 가까운 노드들을 묶음
-    3. 결과: 서로 겹치지 않는 명확한 클러스터
+    1. 노드들을 경도/위도 기준으로 "선을 그어" 분할
+    2. 분할 비율은 capacities에 맞게 조정
+    3. 한 영역이 다른 영역을 감싸는 것 불가능 (물리적으로)
+    
+    Args:
+        nodes_data: [{'idx': int, 'lat': float, 'lon': float}, ...]
+        capacities: [20, 20, 20, 13] - 각 클러스터가 가져야 할 크기
+    
+    Returns:
+        [cluster0_nodes, cluster1_nodes, ...]
     """
     
-    print("\n=== 1단계: 노드 분포 기반 클러스터링 ===")
+    n_clusters = len(capacities)
     
-    # 노드 좌표 추출 (depot 제외)
-    coords = []
-    node_indices = []
+    # 종료 조건: 클러스터 1개
+    if n_clusters == 1:
+        return [nodes_data]
     
-    for i in range(len(df)):
-        if i == depot_idx:
-            continue
-        coords.append([float(df.iloc[i]['lat']), float(df.iloc[i]['lon'])])
-        node_indices.append(i)
+    if len(nodes_data) == 0:
+        return [[] for _ in range(n_clusters)]
     
-    coords = np.array(coords)
+    # 위도/경도 범위 계산
+    lats = [n['lat'] for n in nodes_data]
+    lons = [n['lon'] for n in nodes_data]
     
-    # K-Means 클러스터링
-    labels, centroids = kmeans_clustering(coords, n_clusters)
+    lat_range = max(lats) - min(lats)
+    lon_range = max(lons) - min(lons)
     
-    # 결과 정리
-    cluster_nodes = {i: [] for i in range(n_clusters)}
-    for i, node_idx in enumerate(node_indices):
-        cluster_id = labels[i]
-        cluster_nodes[cluster_id].append(node_idx)
+    # 더 넓은 축으로 분할 (직관적인 경계 생성)
+    if lat_range >= lon_range:
+        # 위도 기준 분할 (남북)
+        sorted_nodes = sorted(nodes_data, key=lambda n: n['lat'])
+        axis = 'lat'
+    else:
+        # 경도 기준 분할 (동서)
+        sorted_nodes = sorted(nodes_data, key=lambda n: n['lon'])
+        axis = 'lon'
     
-    # 클러스터별 정보
-    cluster_info = []
-    for cluster_id in range(n_clusters):
-        nodes = cluster_nodes[cluster_id]
-        if nodes:
-            center_lat = centroids[cluster_id][0]
-            center_lon = centroids[cluster_id][1]
-        else:
-            center_lat, center_lon = 0, 0
-        
-        cluster_info.append({
-            'cluster_id': cluster_id,
-            'node_count': len(nodes),
-            'center_lat': center_lat,
-            'center_lon': center_lon
-        })
-        print(f"  클러스터 {cluster_id}: {len(nodes)}개 노드, 중심=({center_lat:.4f}, {center_lon:.4f})")
+    # 클러스터를 두 그룹으로 나누기
+    left_clusters = n_clusters // 2
+    right_clusters = n_clusters - left_clusters
     
-    return cluster_nodes, cluster_info, centroids
+    left_capacities = capacities[:left_clusters]
+    right_capacities = capacities[left_clusters:]
+    
+    # 분할 비율 계산 (capacity 비율에 따라)
+    total_left_cap = sum(left_capacities)
+    total_right_cap = sum(right_capacities)
+    total_cap = total_left_cap + total_right_cap
+    
+    # 분할 위치: capacity 비율에 맞게
+    split_ratio = total_left_cap / total_cap
+    split_idx = int(len(sorted_nodes) * split_ratio)
+    
+    # 최소 1개는 각 그룹에
+    split_idx = max(1, min(split_idx, len(sorted_nodes) - 1))
+    
+    left_nodes = sorted_nodes[:split_idx]
+    right_nodes = sorted_nodes[split_idx:]
+    
+    indent = "  " * depth
+    print(f"{indent}분할 ({axis}): 왼쪽 {len(left_nodes)}개 (cap={total_left_cap}), 오른쪽 {len(right_nodes)}개 (cap={total_right_cap})")
+    
+    # 재귀 호출
+    left_result = capacity_aware_bisection(left_nodes, left_capacities, depth + 1)
+    right_result = capacity_aware_bisection(right_nodes, right_capacities, depth + 1)
+    
+    return left_result + right_result
 
 
-def match_clusters_to_drivers(cluster_info, drivers, df, depot_idx=0):
+def assign_clusters_to_drivers(clusters, drivers, df, depot_idx=0):
     """
-    ★ V11.3: 클러스터-기사 최적 매칭 ★
+    ★ V11.4: 클러스터-기사 매칭 ★
     
     원칙:
-    1. 큰 클러스터 → max_capa 큰 기사
-    2. 기사 거점과 클러스터 중심 거리는 보조 기준
-    
-    알고리즘: 크기 우선 Greedy 매칭
+    - 클러스터 크기와 기사 max_capa가 이미 맞춰져 있음
+    - 기사 거점과 클러스터 중심 거리로 최적 매칭
     """
     
     print("\n=== 2단계: 클러스터-기사 매칭 ===")
     
-    # 기사 정보 정리
+    n_clusters = len(clusters)
+    n_drivers = len(drivers)
+    
+    # 기사 정보
     driver_info = []
     for i, driver in enumerate(drivers):
         max_capa = driver.max_capa if driver.max_capa else DEFAULT_MAX_CAPA
@@ -169,182 +153,111 @@ def match_clusters_to_drivers(cluster_info, drivers, df, depot_idx=0):
             'base_lng': base_lng
         })
     
-    # 클러스터를 노드 수 내림차순 정렬
-    sorted_clusters = sorted(cluster_info, key=lambda x: -x['node_count'])
+    # 클러스터 중심점 계산
+    cluster_centers = []
+    for i, cluster in enumerate(clusters):
+        if cluster:
+            center_lat = np.mean([n['lat'] for n in cluster])
+            center_lon = np.mean([n['lon'] for n in cluster])
+        else:
+            center_lat, center_lon = 0, 0
+        cluster_centers.append((center_lat, center_lon))
+        print(f"  클러스터 {i}: {len(cluster)}건, 중심=({center_lat:.4f}, {center_lon:.4f})")
     
-    # 기사를 max_capa 내림차순 정렬
-    sorted_drivers = sorted(driver_info, key=lambda x: -x['max_capa'])
-    
-    print(f"  클러스터 크기: {[c['node_count'] for c in sorted_clusters]}")
-    print(f"  기사 max_capa: {[d['max_capa'] for d in sorted_drivers]}")
-    
-    # 1:1 매칭 (크기순)
+    # Greedy 매칭: 각 클러스터에 가장 적합한 기사 배정
+    # 기준: 크기 매칭 + 거리
     cluster_to_driver = {}
+    used_drivers = set()
     
-    for i, c_info in enumerate(sorted_clusters):
-        if i < len(sorted_drivers):
-            d_info = sorted_drivers[i]
-            cluster_to_driver[c_info['cluster_id']] = d_info['driver_idx']
-            print(f"  클러스터 {c_info['cluster_id']} ({c_info['node_count']}건) → {d_info['driver'].name} (max_capa={d_info['max_capa']})")
+    # 클러스터를 크기 내림차순으로 처리
+    cluster_order = sorted(range(n_clusters), key=lambda i: -len(clusters[i]))
+    
+    for cluster_idx in cluster_order:
+        cluster = clusters[cluster_idx]
+        center = cluster_centers[cluster_idx]
+        cluster_size = len(cluster)
+        
+        best_driver = None
+        best_score = float('inf')
+        
+        for d_info in driver_info:
+            if d_info['driver_idx'] in used_drivers:
+                continue
+            
+            # 점수: |클러스터 크기 - max_capa| * 1000 + 거리
+            size_diff = abs(cluster_size - d_info['max_capa'])
+            dist = haversine(center[0], center[1], d_info['base_lat'], d_info['base_lng'])
+            score = size_diff * 1000 + dist
+            
+            if score < best_score:
+                best_score = score
+                best_driver = d_info
+        
+        if best_driver:
+            cluster_to_driver[cluster_idx] = best_driver['driver_idx']
+            used_drivers.add(best_driver['driver_idx'])
+            print(f"  클러스터 {cluster_idx} ({cluster_size}건) → {best_driver['driver'].name} (max_capa={best_driver['max_capa']})")
     
     return cluster_to_driver, driver_info
 
 
-def balance_clusters_by_capacity(df, cluster_nodes, cluster_info, cluster_to_driver, driver_info, depot_idx=0):
+def trim_excess_nodes(clusters, cluster_to_driver, driver_info, df):
     """
-    ★ V11.3: max_capa 기반 클러스터 경계 조정 ★
+    ★ V11.4: 초과 노드 제거 (미배정 처리) ★
     
-    클러스터 노드 수 > 기사 max_capa인 경우:
-    1. 클러스터 중심에서 가장 먼 노드 (경계 노드) 찾기
-    2. 인접 클러스터 중 여유 있는 곳으로 이전
-    3. 이전 시 "가장 가까운 클러스터 중심"으로 이동 (지리적 연속성 유지)
+    클러스터 내 노드 수 > 기사 max_capa인 경우:
+    - 클러스터 중심에서 가장 먼 노드를 미배정 처리
+    - 다른 클러스터로 이전하지 않음! (경계 유지)
     """
     
-    print("\n=== 3단계: max_capa 기반 경계 조정 ===")
+    print("\n=== 3단계: 초과 노드 처리 ===")
     
-    # 현재 상태 복사
-    balanced = {k: list(v) for k, v in cluster_nodes.items()}
-    
-    # 기사별 max_capa
     driver_max_capa = {d['driver_idx']: d['max_capa'] for d in driver_info}
     
-    # 클러스터 중심점
-    cluster_centers = {c['cluster_id']: (c['center_lat'], c['center_lon']) for c in cluster_info}
+    trimmed_clusters = []
+    all_unassigned = []
     
-    max_iterations = 100
-    total_moved = 0
-    
-    for iteration in range(max_iterations):
-        moved = False
-        
-        for cluster_id, nodes in list(balanced.items()):
-            if cluster_id not in cluster_to_driver:
-                continue
-            
-            driver_idx = cluster_to_driver[cluster_id]
-            max_capa = driver_max_capa[driver_idx]
-            excess = len(nodes) - max_capa
-            
-            if excess <= 0:
-                continue
-            
-            # 클러스터 중심
-            center = cluster_centers[cluster_id]
-            
-            # 중심에서 가장 먼 노드들 (경계 노드)
-            nodes_with_dist = []
-            for node_idx in nodes:
-                node_lat = float(df.iloc[node_idx]['lat'])
-                node_lon = float(df.iloc[node_idx]['lon'])
-                dist = haversine(center[0], center[1], node_lat, node_lon)
-                nodes_with_dist.append((node_idx, dist, node_lat, node_lon))
-            
-            nodes_with_dist.sort(key=lambda x: -x[1])  # 거리 내림차순
-            
-            # 초과분 이전
-            for node_idx, _, node_lat, node_lon in nodes_with_dist[:excess]:
-                # 여유 있는 클러스터 중 해당 노드와 가장 가까운 중심 찾기
-                best_target = None
-                best_dist = float('inf')
-                
-                for other_cluster_id, other_nodes in balanced.items():
-                    if other_cluster_id == cluster_id:
-                        continue
-                    if other_cluster_id not in cluster_to_driver:
-                        continue
-                    
-                    other_driver_idx = cluster_to_driver[other_cluster_id]
-                    other_max_capa = driver_max_capa[other_driver_idx]
-                    
-                    # 여유 확인
-                    if len(other_nodes) >= other_max_capa:
-                        continue
-                    
-                    # 해당 클러스터 중심과의 거리
-                    other_center = cluster_centers[other_cluster_id]
-                    dist = haversine(node_lat, node_lon, other_center[0], other_center[1])
-                    
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_target = other_cluster_id
-                
-                if best_target is not None:
-                    balanced[cluster_id].remove(node_idx)
-                    balanced[best_target].append(node_idx)
-                    moved = True
-                    total_moved += 1
-        
-        if not moved:
-            break
-    
-    print(f"  총 {total_moved}개 노드 이전")
-    
-    # 최종 상태
-    print(f"\n  조정 후 클러스터별 노드 수:")
-    for cluster_id, nodes in balanced.items():
-        if cluster_id in cluster_to_driver:
-            driver_idx = cluster_to_driver[cluster_id]
-            d_info = next(d for d in driver_info if d['driver_idx'] == driver_idx)
-            max_capa = d_info['max_capa']
-            status = "✅" if len(nodes) <= max_capa else "❌"
-            print(f"    클러스터 {cluster_id} → {d_info['driver'].name}: {len(nodes)}건 (max={max_capa}) {status}")
-    
-    return balanced
-
-
-def handle_overflow(df, balanced, cluster_to_driver, driver_info, cluster_info):
-    """
-    총 노드 > 총 max_capa인 경우 미배정 처리
-    기준: 클러스터 중심에서 가장 먼 노드들
-    """
-    
-    print("\n=== 4단계: 초과분 처리 ===")
-    
-    total_max_capa = sum(d['max_capa'] for d in driver_info)
-    total_nodes = sum(len(nodes) for nodes in balanced.values())
-    overflow = total_nodes - total_max_capa
-    
-    if overflow <= 0:
-        print(f"  초과 없음")
-        return balanced, []
-    
-    print(f"  {overflow}건 미배정 필요")
-    
-    # 클러스터 중심
-    cluster_centers = {c['cluster_id']: (c['center_lat'], c['center_lon']) for c in cluster_info}
-    
-    # 모든 노드의 "클러스터 중심에서의 거리" 계산
-    all_nodes = []
-    for cluster_id, nodes in balanced.items():
-        if cluster_id not in cluster_centers:
+    for cluster_idx, cluster in enumerate(clusters):
+        if cluster_idx not in cluster_to_driver:
+            trimmed_clusters.append(cluster)
             continue
-        center = cluster_centers[cluster_id]
         
-        for node_idx in nodes:
-            node_lat = float(df.iloc[node_idx]['lat'])
-            node_lon = float(df.iloc[node_idx]['lon'])
-            dist = haversine(center[0], center[1], node_lat, node_lon)
-            all_nodes.append({
-                'node_idx': node_idx,
-                'cluster_id': cluster_id,
-                'dist': dist
-            })
-    
-    # 거리 내림차순 (먼 것부터 제거)
-    all_nodes.sort(key=lambda x: -x['dist'])
-    
-    unassigned = []
-    for node_info in all_nodes[:overflow]:
-        node_idx = node_info['node_idx']
-        cluster_id = node_info['cluster_id']
+        driver_idx = cluster_to_driver[cluster_idx]
+        max_capa = driver_max_capa[driver_idx]
         
-        if node_idx in balanced[cluster_id]:
-            balanced[cluster_id].remove(node_idx)
-            unassigned.append(node_idx)
+        if len(cluster) <= max_capa:
+            trimmed_clusters.append(cluster)
+            continue
+        
+        # 초과분 제거
+        excess = len(cluster) - max_capa
+        
+        # 클러스터 중심
+        center_lat = np.mean([n['lat'] for n in cluster])
+        center_lon = np.mean([n['lon'] for n in cluster])
+        
+        # 중심에서 거리 계산
+        nodes_with_dist = []
+        for node in cluster:
+            dist = haversine(center_lat, center_lon, node['lat'], node['lon'])
+            nodes_with_dist.append((node, dist))
+        
+        # 거리순 정렬 (가까운 것부터)
+        nodes_with_dist.sort(key=lambda x: x[1])
+        
+        # max_capa만큼만 유지, 나머지는 미배정
+        kept = [n[0] for n in nodes_with_dist[:max_capa]]
+        removed = [n[0] for n in nodes_with_dist[max_capa:]]
+        
+        trimmed_clusters.append(kept)
+        all_unassigned.extend(removed)
+        
+        d_info = next(d for d in driver_info if d['driver_idx'] == driver_idx)
+        print(f"  클러스터 {cluster_idx} ({d_info['driver'].name}): {len(cluster)} → {len(kept)}건 (미배정 {len(removed)}건)")
     
-    print(f"  {len(unassigned)}건 미배정")
+    print(f"  총 미배정: {len(all_unassigned)}건")
     
-    return balanced, unassigned
+    return trimmed_clusters, all_unassigned
 
 
 def optimize_visit_order(df, nodes, start_lat, start_lon):
@@ -352,21 +265,20 @@ def optimize_visit_order(df, nodes, start_lat, start_lon):
     if not nodes:
         return []
     if len(nodes) == 1:
-        return list(nodes)
+        return [nodes[0]['idx']]
     
     visited = []
-    remaining = set(nodes)
+    remaining = list(nodes)
     current_lat, current_lon = start_lat, start_lon
     
     while remaining:
-        nearest = min(remaining, key=lambda idx: haversine(
+        nearest_idx = min(range(len(remaining)), key=lambda i: haversine(
             current_lat, current_lon,
-            float(df.iloc[idx]['lat']), float(df.iloc[idx]['lon'])
+            remaining[i]['lat'], remaining[i]['lon']
         ))
-        visited.append(nearest)
-        remaining.remove(nearest)
-        current_lat = float(df.iloc[nearest]['lat'])
-        current_lon = float(df.iloc[nearest]['lon'])
+        nearest = remaining.pop(nearest_idx)
+        visited.append(nearest['idx'])
+        current_lat, current_lon = nearest['lat'], nearest['lon']
     
     return visited
 
@@ -392,28 +304,28 @@ def calculate_route_distance(df, visit_order, start_lat, start_lon):
 def read_root():
     return {
         "status": "active",
-        "message": "VRP Engine V11.3 (Node-Distribution Clustering)",
+        "message": "VRP Engine V11.4 (Capacity-Aware Recursive Bisection)",
         "features": [
-            "★ 노드 분포 기반 클러스터링 (거점 무시)",
-            "★ K-Means로 지리적으로 가까운 노드 묶음",
-            "★ 클러스터 간 겹침/감싸기 없음",
-            "★ 클러스터-기사 매칭: 크기 → max_capa",
-            "max_capa 경계 조정",
+            "★ 경도/위도 기준 선 긋기 (물리적 분할)",
+            "★ capacity 비율에 따른 분할 크기 조정",
+            "★ 한 영역이 다른 영역을 감쌀 수 없음",
+            "★ 경계 조정 없음 (다른 클러스터로 이전 X)",
+            "★ 초과분은 미배정 처리",
             "Nearest Neighbor TSP"
         ],
-        "algorithm": "K-Means Geographic Clustering → Size-based Driver Matching → Boundary Adjustment"
+        "algorithm": "Capacity-Aware Recursive Bisection → Driver Matching → Trim Excess"
     }
 
 
 @app.post("/optimize")
 def optimize_routes(body: RequestBody):
     """
-    ★ V11.3: 노드 분포 기반 클러스터링 ★
+    ★ V11.4: Capacity-Aware Recursive Bisection ★
     
-    핵심:
-    1. 기사 거점 무시, 노드 위치만으로 클러스터링
-    2. K-Means로 지리적으로 명확한 경계 생성
-    3. 클러스터 크기와 기사 max_capa 매칭
+    핵심 원칙:
+    1. 경도/위도 기준으로 "선을 그어" 분할 (감싸기 불가능)
+    2. 분할 크기는 max_capa 비율에 맞게
+    3. 초과분은 미배정 (다른 클러스터로 이전 X)
     """
     
     try:
@@ -438,34 +350,48 @@ def optimize_routes(body: RequestBody):
             ]
         
         num_drivers = len(drivers)
-        total_max_capa = sum(d.max_capa or DEFAULT_MAX_CAPA for d in drivers)
+        
+        # max_capa 리스트 (내림차순 정렬)
+        capacities = sorted([d.max_capa or DEFAULT_MAX_CAPA for d in drivers], reverse=True)
+        total_max_capa = sum(capacities)
         total_calls = num_locations - 1
         
         print(f"\n{'='*50}")
-        print(f"VRP V11.3 - Node-Distribution Clustering")
+        print(f"VRP V11.4 - Capacity-Aware Recursive Bisection")
         print(f"{'='*50}")
         print(f"총 콜: {total_calls}건, 수용량: {total_max_capa}건")
+        print(f"Capacities (정렬): {capacities}")
         
         if 'weight' not in df.columns:
             df['weight'] = DEFAULT_WEIGHT_KG
         df['weight'] = pd.to_numeric(df['weight'], errors='coerce').fillna(DEFAULT_WEIGHT_KG).astype(int)
         
-        # 2. 노드 분포 기반 클러스터링
-        cluster_nodes, cluster_info, centroids = geographic_clustering(df, num_drivers, depot_idx)
+        # 노드 데이터 준비 (depot 제외)
+        nodes_data = []
+        for i in range(len(df)):
+            if i == depot_idx:
+                continue
+            nodes_data.append({
+                'idx': i,
+                'lat': float(df.iloc[i]['lat']),
+                'lon': float(df.iloc[i]['lon']),
+                'weight': int(df.iloc[i]['weight'])
+            })
+        
+        # 2. Capacity-Aware Recursive Bisection
+        print("\n=== 1단계: Capacity-Aware Bisection ===")
+        clusters = capacity_aware_bisection(nodes_data, capacities)
+        
+        print(f"\n  분할 결과: {[len(c) for c in clusters]}")
         
         # 3. 클러스터-기사 매칭
-        cluster_to_driver, driver_info = match_clusters_to_drivers(cluster_info, drivers, df, depot_idx)
+        cluster_to_driver, driver_info = assign_clusters_to_drivers(clusters, drivers, df, depot_idx)
         
-        # 4. max_capa 경계 조정
-        balanced = balance_clusters_by_capacity(
-            df, cluster_nodes, cluster_info, cluster_to_driver, driver_info, depot_idx
-        )
+        # 4. 초과 노드 제거
+        trimmed_clusters, unassigned_nodes = trim_excess_nodes(clusters, cluster_to_driver, driver_info, df)
         
-        # 5. 초과분 처리
-        balanced, unassigned = handle_overflow(df, balanced, cluster_to_driver, driver_info, cluster_info)
-        
-        # 6. 결과 생성
-        print("\n=== 5단계: 방문 순서 최적화 ===")
+        # 5. 결과 생성
+        print("\n=== 4단계: 방문 순서 최적화 ===")
         
         results = []
         stats = []
@@ -473,18 +399,18 @@ def optimize_routes(body: RequestBody):
         
         driver_info_map = {d['driver_idx']: d for d in driver_info}
         
-        for cluster_id, nodes in balanced.items():
-            if cluster_id not in cluster_to_driver:
+        for cluster_idx, cluster in enumerate(trimmed_clusters):
+            if cluster_idx not in cluster_to_driver:
                 continue
             
-            driver_idx = cluster_to_driver[cluster_id]
+            driver_idx = cluster_to_driver[cluster_idx]
             d_info = driver_info_map[driver_idx]
             driver = d_info['driver']
             max_capa = d_info['max_capa']
             base_lat = d_info['base_lat']
             base_lng = d_info['base_lng']
             
-            if not nodes:
+            if not cluster:
                 stats.append({
                     "driver_id": driver.id,
                     "driver_name": driver.name,
@@ -496,7 +422,7 @@ def optimize_routes(body: RequestBody):
                 })
                 continue
             
-            visit_order = optimize_visit_order(df, nodes, base_lat, base_lng)
+            visit_order = optimize_visit_order(df, cluster, base_lat, base_lng)
             route_distance = calculate_route_distance(df, visit_order, base_lat, base_lng)
             total_distance += route_distance
             
@@ -531,9 +457,10 @@ def optimize_routes(body: RequestBody):
             print(f"  {driver.name}: {call_count}건, {route_distance:.1f}km")
         
         violations = [s for s in stats if s['call_count'] > s['max_capa']]
+        unassigned_ids = [str(df.iloc[n['idx']]['id']) for n in unassigned_nodes]
         
         print(f"\n{'='*50}")
-        print(f"완료: 배정 {len(results)}건, 미배정 {len(unassigned)}건")
+        print(f"완료: 배정 {len(results)}건, 미배정 {len(unassigned_nodes)}건")
         print(f"{'='*50}")
         
         return {
@@ -543,14 +470,15 @@ def optimize_routes(body: RequestBody):
             "summary": {
                 "total_locations": total_calls,
                 "total_assigned": len(results),
-                "unassigned": len(unassigned),
-                "unassigned_ids": [str(df.iloc[idx]['id']) for idx in unassigned],
+                "unassigned": len(unassigned_nodes),
+                "unassigned_ids": unassigned_ids,
                 "total_distance_km": round(total_distance, 2)
             },
             "optimization_info": {
-                "algorithm": "V11.3: Node-Distribution K-Means + Size-based Matching",
+                "algorithm": "V11.4: Capacity-Aware Recursive Bisection",
                 "max_capa_violations": len(violations),
-                "cluster_overlap": 0
+                "cluster_overlap": 0,
+                "note": "경도/위도 기준 선 긋기로 영역 분할, 감싸기 불가능"
             }
         }
         
