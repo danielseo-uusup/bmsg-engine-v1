@@ -36,8 +36,8 @@ class Driver(BaseModel):
 
 class RequestBody(BaseModel):
     locations: List[Location]
-    drivers: Optional[List[Driver]] = None  # ★ 선택적 필드로 변경
-    num_vehicles: int = 4  # drivers 없을 때 사용
+    drivers: Optional[List[Driver]] = None
+    num_vehicles: int = 4
     vehicle_capacity: int = VEHICLE_CAPACITY_KG
 
 
@@ -94,44 +94,103 @@ def get_cluster_stats(df, assignments, vehicle_id):
     }
 
 
-def match_clusters_to_drivers(df, assignments, drivers, num_clusters, depot_idx=0):
-    """클러스터-기사 최적 매칭 (거점 기반)"""
+def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_idx=0):
+    """
+    ★ V10.2 신규: max_capa를 고려한 클러스터-기사 매칭 ★
     
-    # 클러스터 중심점 계산
+    기존 문제점:
+    - 거점 거리만 고려해서 매칭
+    - max_capa가 20인 기사가 콜 10개 클러스터에, max_capa가 10인 기사가 콜 20개 클러스터에 매칭되는 문제
+    
+    해결 방안:
+    1. 각 클러스터의 콜 수 계산
+    2. 기사의 max_capa가 클러스터 콜 수보다 작으면 매칭 후보에서 제외
+    3. 적합한 후보 중에서 거점 거리가 가장 가까운 기사 선택
+    4. 적합한 후보가 없으면 max_capa가 가장 큰 기사 선택 (차선책)
+    """
+    
+    # 1. 클러스터별 통계 계산
+    cluster_stats = {}
+    for cluster_id in range(num_clusters):
+        stats = get_cluster_stats(df, assignments, cluster_id)
+        cluster_stats[cluster_id] = stats
+        print(f"  클러스터 {cluster_id}: {stats['call_count']}건, {stats['total_weight']}kg")
+    
+    # 2. 클러스터 중심점 계산
     cluster_centroids = {}
     for cluster_id in range(num_clusters):
         centroid = calculate_cluster_centroid(df, assignments, cluster_id)
         if centroid:
             cluster_centroids[cluster_id] = centroid
     
-    # 기사 거점 정보
-    driver_bases = {}
+    # 3. 기사 정보 정리
+    driver_info = {}
     for i, driver in enumerate(drivers):
+        max_capa = driver.max_capa if driver.max_capa else DEFAULT_MAX_CAPA
         if driver.base_lat is not None and driver.base_lng is not None:
-            driver_bases[i] = (driver.base_lat, driver.base_lng)
+            base = (driver.base_lat, driver.base_lng)
         else:
-            driver_bases[i] = (float(df.iloc[depot_idx]['lat']), float(df.iloc[depot_idx]['lon']))
+            base = (float(df.iloc[depot_idx]['lat']), float(df.iloc[depot_idx]['lon']))
+        
+        driver_info[i] = {
+            'name': driver.name,
+            'max_capa': max_capa,
+            'base': base
+        }
+        print(f"  기사 {i} ({driver.name}): max_capa={max_capa}")
     
-    # Greedy 매칭
+    # 4. ★ 핵심 로직: max_capa를 고려한 매칭 ★
     cluster_to_driver = {}
     used_drivers = set()
     
-    pairs = []
-    for cluster_id in cluster_centroids.keys():
-        for driver_id in driver_bases.keys():
-            centroid = cluster_centroids[cluster_id]
-            base = driver_bases[driver_id]
-            dist = haversine(centroid[0], centroid[1], base[0], base[1])
-            pairs.append((dist, cluster_id, driver_id))
+    # 클러스터를 콜 수 내림차순으로 정렬 (콜 수 많은 클러스터부터 처리)
+    # → max_capa가 큰 기사를 먼저 배정받을 수 있도록
+    sorted_clusters = sorted(
+        cluster_stats.keys(),
+        key=lambda c: cluster_stats[c]['call_count'],
+        reverse=True
+    )
     
-    pairs.sort(key=lambda x: x[0])
+    print(f"\n  클러스터 처리 순서 (콜 수 내림차순): {sorted_clusters}")
     
-    for dist, cluster_id, driver_id in pairs:
-        if cluster_id not in cluster_to_driver and driver_id not in used_drivers:
-            cluster_to_driver[cluster_id] = driver_id
-            used_drivers.add(driver_id)
+    for cluster_id in sorted_clusters:
+        if cluster_id not in cluster_centroids:
+            continue
+        
+        cluster_calls = cluster_stats[cluster_id]['call_count']
+        centroid = cluster_centroids[cluster_id]
+        
+        # 적합한 기사 후보 찾기 (max_capa >= 클러스터 콜 수)
+        candidates = []
+        for driver_id, info in driver_info.items():
+            if driver_id in used_drivers:
+                continue
+            
+            # ★ 핵심: max_capa가 클러스터 콜 수 이상인 기사만 후보로
+            if info['max_capa'] >= cluster_calls:
+                dist = haversine(centroid[0], centroid[1], info['base'][0], info['base'][1])
+                candidates.append((driver_id, dist, info['max_capa']))
+        
+        if candidates:
+            # 적합한 후보 중 거리가 가장 가까운 기사 선택
+            candidates.sort(key=lambda x: x[1])  # 거리순 정렬
+            best_driver = candidates[0][0]
+            print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}, max_capa={driver_info[best_driver]['max_capa']}) [거리 기반]")
+        else:
+            # 적합한 후보가 없으면 남은 기사 중 max_capa가 가장 큰 기사 선택
+            remaining = [(d, info['max_capa']) for d, info in driver_info.items() if d not in used_drivers]
+            if remaining:
+                remaining.sort(key=lambda x: -x[1])  # max_capa 내림차순
+                best_driver = remaining[0][0]
+                print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}, max_capa={driver_info[best_driver]['max_capa']}) [차선책: 적합 후보 없음]")
+            else:
+                best_driver = 0
+                print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 0 [fallback]")
+        
+        cluster_to_driver[cluster_id] = best_driver
+        used_drivers.add(best_driver)
     
-    # 매칭 안 된 클러스터
+    # 매칭 안 된 클러스터 처리 (빈 클러스터 등)
     remaining_drivers = set(range(len(drivers))) - used_drivers
     for cluster_id in range(num_clusters):
         if cluster_id not in cluster_to_driver:
@@ -140,6 +199,7 @@ def match_clusters_to_drivers(df, assignments, drivers, num_clusters, depot_idx=
             else:
                 cluster_to_driver[cluster_id] = 0
     
+    print(f"\n  최종 매칭 결과: {cluster_to_driver}")
     return cluster_to_driver
 
 
@@ -343,23 +403,24 @@ def optimize_visit_order(df, assignments, cluster_id, depot_idx=0):
 def read_root():
     return {
         "status": "active",
-        "message": "VRP Engine V10.1 (Backward Compatible)",
+        "message": "VRP Engine V10.2 (Capacity-Aware Matching)",
         "features": [
             "drivers 필드 선택적 (없으면 num_vehicles 사용)",
             "기사별 max_capa 하드캡",
-            "기사 거점 기반 클러스터 매칭",
+            "★ V10.2: max_capa 고려한 클러스터-기사 매칭",
+            "콜 수 많은 클러스터 → max_capa 큰 기사 우선 배정",
             "Smart Swap / Mutual Swap 후처리"
-        ]
+        ],
+        "changelog": {
+            "v10.2": "클러스터-기사 매칭 시 max_capa 제약 추가. 콜 수 초과 매칭 방지."
+        }
     }
 
 
 @app.post("/optimize")
 def optimize_routes(body: RequestBody):
     """
-    OR-Tools CVRP + 기사별 제약 + 거점 매칭
-    
-    - drivers 있으면: 기사별 max_capa, 거점 매칭 사용
-    - drivers 없으면: num_vehicles로 기존 방식 동작
+    OR-Tools CVRP + 기사별 제약 + ★ max_capa 고려 매칭 ★
     """
     
     try:
@@ -374,13 +435,12 @@ def optimize_routes(body: RequestBody):
         if num_locations < 2:
             return {"status": "error", "message": "Not enough locations"}
         
-        # ★ drivers 유무에 따라 분기 ★
+        # drivers 유무에 따라 분기
         if body.drivers and len(body.drivers) > 0:
             drivers = body.drivers
             num_vehicles = len(drivers)
             use_driver_features = True
         else:
-            # 기본 기사 생성 (기존 방식 호환)
             num_vehicles = body.num_vehicles
             drivers = [
                 Driver(
@@ -403,6 +463,11 @@ def optimize_routes(body: RequestBody):
             kg_capa = driver.vehicle_capacity_kg if driver.vehicle_capacity_kg else body.vehicle_capacity
             driver_max_capas.append(max_capa)
             driver_kg_capas.append(kg_capa)
+        
+        print(f"\n=== VRP V10.2 최적화 시작 ===")
+        print(f"총 위치: {num_locations}개, 기사: {num_vehicles}명")
+        print(f"기사별 max_capa: {driver_max_capas}")
+        print(f"총 수용 가능: {sum(driver_max_capas)}건")
         
         # weight 처리
         if 'weight' not in df.columns:
@@ -513,12 +578,12 @@ def optimize_routes(body: RequestBody):
         
         total_swaps = smart_swaps + mutual_swaps
         
-        # 7. 클러스터-기사 매칭
+        # 7. ★ V10.2: max_capa 고려한 클러스터-기사 매칭 ★
+        print("\n=== 클러스터-기사 매칭 (V10.2) ===")
         if use_driver_features:
-            cluster_to_driver = match_clusters_to_drivers(
+            cluster_to_driver = match_clusters_to_drivers_v2(
                 df, cluster_assignments, drivers, num_vehicles, depot_idx)
         else:
-            # 기본: 클러스터 ID = 기사 ID
             cluster_to_driver = {i: i for i in range(num_vehicles)}
         
         # 8. 결과 생성
@@ -598,6 +663,9 @@ def optimize_routes(body: RequestBody):
         all_ids = set(str(df.iloc[i]['id']) for i in range(1, len(df)))
         unassigned_ids = all_ids - assigned_ids
         
+        print(f"\n=== 최적화 완료 ===")
+        print(f"배정: {len(results)}건, 미배정: {len(unassigned_ids)}건")
+        
         return {
             "status": "success",
             "updates": results,
@@ -618,7 +686,8 @@ def optimize_routes(body: RequestBody):
                 "message": f"후처리로 {total_swaps}건 재배정"
             },
             "matching_info": {
-                "cluster_to_driver": {f"클러스터{k}": drivers[v].name for k, v in cluster_to_driver.items()}
+                "cluster_to_driver": {f"클러스터{k}": drivers[v].name for k, v in cluster_to_driver.items()},
+                "algorithm": "V10.2: max_capa 고려 매칭"
             } if use_driver_features else None
         }
         
