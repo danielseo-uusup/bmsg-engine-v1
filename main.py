@@ -7,6 +7,8 @@ import numpy as np
 import traceback
 from typing import Optional, List
 from sklearn.cluster import KMeans
+from scipy.spatial import ConvexHull
+from shapely.geometry import Point, Polygon
 
 app = FastAPI()
 
@@ -16,6 +18,7 @@ VEHICLE_CAPACITY_KG = 1200
 DEFAULT_MAX_CAPA = 25
 MIN_CALLS_SOFT = 10
 DEFAULT_WEIGHT_KG = 15
+CORE_NODE_RATIO = 0.9  # ★ V10.4: 70% → 90%로 상향
 
 
 # --- 데이터 모델 ---
@@ -97,16 +100,8 @@ def get_cluster_stats(df, assignments, vehicle_id):
 
 def create_geographic_clusters(df, num_clusters, depot_idx=0):
     """
-    ★ V10.3 신규: K-Means 기반 지리적 클러스터링 ★
-    
-    목적: 
-    - 지리적으로 가까운 노드들을 같은 그룹으로 묶음
-    - OR-Tools에 "같은 그룹은 같은 차량" 힌트 제공
-    
-    Returns:
-        node_to_cluster: {node_idx: cluster_id} 매핑
+    K-Means 기반 지리적 클러스터링
     """
-    # depot 제외한 좌표 추출
     coords = []
     node_indices = []
     
@@ -117,15 +112,12 @@ def create_geographic_clusters(df, num_clusters, depot_idx=0):
         node_indices.append(i)
     
     if len(coords) < num_clusters:
-        # 노드가 클러스터 수보다 적으면 각자 별도 클러스터
-        return {idx: i % num_clusters for i, idx in enumerate(node_indices)}
+        return {idx: i % num_clusters for i, idx in enumerate(node_indices)}, None
     
-    # K-Means 클러스터링
     coords_array = np.array(coords)
     kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
     labels = kmeans.fit_predict(coords_array)
     
-    # 결과 매핑
     node_to_cluster = {}
     for i, node_idx in enumerate(node_indices):
         node_to_cluster[node_idx] = int(labels[i])
@@ -133,26 +125,143 @@ def create_geographic_clusters(df, num_clusters, depot_idx=0):
     return node_to_cluster, kmeans.cluster_centers_
 
 
+def create_convex_hulls(df, node_to_cluster, num_clusters, depot_idx=0):
+    """
+    ★ V10.4 신규: 각 클러스터의 Convex Hull(볼록 껍질) 생성 ★
+    
+    목적:
+    - 각 클러스터의 지리적 경계를 명확하게 정의
+    - 경계 내부/외부 판정에 사용
+    
+    Returns:
+        cluster_hulls: {cluster_id: Polygon} 매핑
+    """
+    cluster_hulls = {}
+    
+    for cluster_id in range(num_clusters):
+        # 해당 클러스터의 노드 좌표 수집
+        cluster_coords = []
+        for node_idx, cid in node_to_cluster.items():
+            if cid == cluster_id:
+                lat = float(df.iloc[node_idx]['lat'])
+                lon = float(df.iloc[node_idx]['lon'])
+                cluster_coords.append([lon, lat])  # Shapely는 (x, y) = (lon, lat)
+        
+        if len(cluster_coords) < 3:
+            # 3개 미만이면 Convex Hull 생성 불가 → 버퍼로 대체
+            if len(cluster_coords) == 1:
+                point = Point(cluster_coords[0])
+                cluster_hulls[cluster_id] = point.buffer(0.01)  # 약 1km 버퍼
+            elif len(cluster_coords) == 2:
+                from shapely.geometry import LineString
+                line = LineString(cluster_coords)
+                cluster_hulls[cluster_id] = line.buffer(0.005)
+            continue
+        
+        try:
+            coords_array = np.array(cluster_coords)
+            hull = ConvexHull(coords_array)
+            hull_points = coords_array[hull.vertices]
+            polygon = Polygon(hull_points)
+            
+            # 약간의 버퍼 추가 (경계에 걸친 노드 포함)
+            cluster_hulls[cluster_id] = polygon.buffer(0.002)  # 약 200m 버퍼
+            
+            print(f"  클러스터 {cluster_id}: Convex Hull 생성 (노드 {len(cluster_coords)}개, 꼭짓점 {len(hull.vertices)}개)")
+        except Exception as e:
+            print(f"  클러스터 {cluster_id}: Convex Hull 생성 실패 - {e}")
+            # 실패 시 모든 점을 포함하는 큰 원으로 대체
+            center = np.mean(coords_array, axis=0)
+            cluster_hulls[cluster_id] = Point(center).buffer(0.05)
+    
+    return cluster_hulls
+
+
+def assign_node_to_best_cluster(df, node_idx, cluster_hulls, node_to_cluster):
+    """
+    ★ V10.4 신규: Convex Hull 기반으로 노드의 최적 클러스터 결정 ★
+    
+    로직:
+    1. 노드가 어떤 Hull 내부에 있는지 확인
+    2. 여러 Hull에 속하면 (겹치는 영역) → 중심에 가장 가까운 클러스터
+    3. 어느 Hull에도 안 속하면 → 가장 가까운 Hull의 클러스터
+    """
+    lat = float(df.iloc[node_idx]['lat'])
+    lon = float(df.iloc[node_idx]['lon'])
+    point = Point(lon, lat)
+    
+    # 1. 어떤 Hull에 속하는지 확인
+    containing_clusters = []
+    for cluster_id, hull in cluster_hulls.items():
+        if hull.contains(point):
+            containing_clusters.append(cluster_id)
+    
+    if len(containing_clusters) == 1:
+        return containing_clusters[0]
+    
+    if len(containing_clusters) > 1:
+        # 여러 Hull에 속함 (겹치는 영역) → 원래 K-Means 할당 유지
+        return node_to_cluster.get(node_idx, containing_clusters[0])
+    
+    # 2. 어느 Hull에도 안 속함 → 가장 가까운 Hull
+    min_dist = float('inf')
+    best_cluster = 0
+    
+    for cluster_id, hull in cluster_hulls.items():
+        dist = point.distance(hull)
+        if dist < min_dist:
+            min_dist = dist
+            best_cluster = cluster_id
+    
+    return best_cluster
+
+
+def enforce_convex_hull_boundaries(df, node_to_cluster, cluster_hulls, num_clusters, depot_idx=0):
+    """
+    ★ V10.4 신규: Convex Hull 경계 기반으로 클러스터 재할당 ★
+    
+    목적:
+    - K-Means 결과를 Convex Hull 경계로 보정
+    - 경계 밖에 있는 노드를 올바른 클러스터로 이동
+    """
+    print("\n=== Convex Hull 경계 보정 ===")
+    
+    reassigned_count = 0
+    new_assignments = dict(node_to_cluster)
+    
+    for node_idx in node_to_cluster.keys():
+        if node_idx == depot_idx:
+            continue
+        
+        original_cluster = node_to_cluster[node_idx]
+        best_cluster = assign_node_to_best_cluster(df, node_idx, cluster_hulls, node_to_cluster)
+        
+        if best_cluster != original_cluster:
+            new_assignments[node_idx] = best_cluster
+            reassigned_count += 1
+            print(f"  노드 {node_idx}: 클러스터 {original_cluster} → {best_cluster}")
+    
+    print(f"  Convex Hull 보정으로 {reassigned_count}개 노드 재할당")
+    
+    return new_assignments
+
+
 def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_idx=0):
     """
     V10.2: max_capa를 고려한 클러스터-기사 매칭
     """
-    
-    # 1. 클러스터별 통계 계산
     cluster_stats = {}
     for cluster_id in range(num_clusters):
         stats = get_cluster_stats(df, assignments, cluster_id)
         cluster_stats[cluster_id] = stats
         print(f"  클러스터 {cluster_id}: {stats['call_count']}건, {stats['total_weight']}kg")
     
-    # 2. 클러스터 중심점 계산
     cluster_centroids = {}
     for cluster_id in range(num_clusters):
         centroid = calculate_cluster_centroid(df, assignments, cluster_id)
         if centroid:
             cluster_centroids[cluster_id] = centroid
     
-    # 3. 기사 정보 정리
     driver_info = {}
     for i, driver in enumerate(drivers):
         max_capa = driver.max_capa if driver.max_capa else DEFAULT_MAX_CAPA
@@ -168,11 +277,9 @@ def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_i
         }
         print(f"  기사 {i} ({driver.name}): max_capa={max_capa}")
     
-    # 4. max_capa를 고려한 매칭
     cluster_to_driver = {}
     used_drivers = set()
     
-    # 클러스터를 콜 수 내림차순으로 정렬
     sorted_clusters = sorted(
         cluster_stats.keys(),
         key=lambda c: cluster_stats[c]['call_count'],
@@ -188,7 +295,6 @@ def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_i
         cluster_calls = cluster_stats[cluster_id]['call_count']
         centroid = cluster_centroids[cluster_id]
         
-        # 적합한 기사 후보 찾기
         candidates = []
         for driver_id, info in driver_info.items():
             if driver_id in used_drivers:
@@ -201,21 +307,19 @@ def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_i
         if candidates:
             candidates.sort(key=lambda x: x[1])
             best_driver = candidates[0][0]
-            print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}, max_capa={driver_info[best_driver]['max_capa']}) [거리 기반]")
+            print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}) [거리 기반]")
         else:
             remaining = [(d, info['max_capa']) for d, info in driver_info.items() if d not in used_drivers]
             if remaining:
                 remaining.sort(key=lambda x: -x[1])
                 best_driver = remaining[0][0]
-                print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}, max_capa={driver_info[best_driver]['max_capa']}) [차선책]")
+                print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}) [차선책]")
             else:
                 best_driver = 0
-                print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 0 [fallback]")
         
         cluster_to_driver[cluster_id] = best_driver
         used_drivers.add(best_driver)
     
-    # 매칭 안 된 클러스터 처리
     remaining_drivers = set(range(len(drivers))) - used_drivers
     for cluster_id in range(num_clusters):
         if cluster_id not in cluster_to_driver:
@@ -260,21 +364,66 @@ def optimize_visit_order(df, assignments, cluster_id, depot_idx=0):
         return assigned_indices
 
 
+def check_cluster_overlap(df, assignments, num_clusters):
+    """클러스터 간 지리적 교차 정도 측정"""
+    centroids = {}
+    for cluster_id in range(num_clusters):
+        centroid = calculate_cluster_centroid(df, assignments, cluster_id)
+        if centroid:
+            centroids[cluster_id] = centroid
+    
+    if len(centroids) < 2:
+        return 0.0
+    
+    overlap_count = 0
+    total_count = 0
+    
+    for node_idx, assigned_cluster in assignments.items():
+        if assigned_cluster not in centroids:
+            continue
+        
+        node_lat = float(df.iloc[node_idx]['lat'])
+        node_lon = float(df.iloc[node_idx]['lon'])
+        
+        own_centroid = centroids[assigned_cluster]
+        own_dist = haversine(node_lat, node_lon, own_centroid[0], own_centroid[1])
+        
+        min_other_dist = float('inf')
+        for other_cluster, other_centroid in centroids.items():
+            if other_cluster == assigned_cluster:
+                continue
+            other_dist = haversine(node_lat, node_lon, other_centroid[0], other_centroid[1])
+            min_other_dist = min(min_other_dist, other_dist)
+        
+        if min_other_dist < own_dist:
+            overlap_count += 1
+        
+        total_count += 1
+    
+    if total_count == 0:
+        return 0.0
+    
+    return round(overlap_count / total_count * 100, 1)
+
+
 @app.get("/")
 def read_root():
     return {
         "status": "active",
-        "message": "VRP Engine V10.3 (Geographic Clustering + Same Route Constraint)",
+        "message": "VRP Engine V10.4 (Convex Hull Boundary Enforcement)",
         "features": [
             "drivers 필드 선택적",
             "기사별 max_capa 하드캡",
-            "★ V10.3: K-Means 사전 클러스터링으로 지리적 그룹화",
-            "★ V10.3: Same Vehicle Constraint로 클러스터 교차 방지",
+            "K-Means 사전 클러스터링",
+            "★ V10.4: 핵심 노드 비율 90%로 상향",
+            "★ V10.4: Convex Hull 경계 기반 클러스터 강제",
+            "Same Vehicle Constraint로 클러스터 교차 방지",
             "max_capa 고려한 클러스터-기사 매칭"
         ],
         "changelog": {
-            "v10.3": "K-Means + Same Vehicle Constraint로 클러스터 간 교차 제거",
-            "v10.2": "클러스터-기사 매칭 시 max_capa 제약 추가"
+            "v10.4": "Convex Hull 경계 강제 + 핵심 노드 90%",
+            "v10.3": "K-Means + Same Vehicle Constraint",
+            "v10.2": "클러스터-기사 매칭 시 max_capa 제약"
         }
     }
 
@@ -282,12 +431,14 @@ def read_root():
 @app.post("/optimize")
 def optimize_routes(body: RequestBody):
     """
-    OR-Tools CVRP + ★ V10.3: 지리적 클러스터링 + Same Vehicle Constraint ★
+    OR-Tools CVRP + ★ V10.4: Convex Hull 경계 강제 ★
     
     핵심 변경:
-    1. K-Means로 먼저 지리적 클러스터 생성
-    2. 같은 클러스터 내 노드들에 Same Vehicle Constraint 적용
-    3. OR-Tools가 클러스터 경계를 존중하면서 최적화
+    1. K-Means로 초기 클러스터링
+    2. 각 클러스터의 Convex Hull 생성
+    3. Convex Hull 경계 기반으로 클러스터 재할당
+    4. Same Vehicle Constraint (핵심 노드 90%)
+    5. OR-Tools 최적화
     """
     
     try:
@@ -302,7 +453,6 @@ def optimize_routes(body: RequestBody):
         if num_locations < 2:
             return {"status": "error", "message": "Not enough locations"}
         
-        # drivers 유무에 따라 분기
         if body.drivers and len(body.drivers) > 0:
             drivers = body.drivers
             num_vehicles = len(drivers)
@@ -322,7 +472,6 @@ def optimize_routes(body: RequestBody):
             ]
             use_driver_features = False
         
-        # 기사별 설정 추출
         driver_max_capas = []
         driver_kg_capas = []
         for driver in drivers:
@@ -331,31 +480,42 @@ def optimize_routes(body: RequestBody):
             driver_max_capas.append(max_capa)
             driver_kg_capas.append(kg_capa)
         
-        print(f"\n=== VRP V10.3 최적화 시작 ===")
+        print(f"\n=== VRP V10.4 최적화 시작 ===")
         print(f"총 위치: {num_locations}개, 기사: {num_vehicles}명")
         print(f"기사별 max_capa: {driver_max_capas}")
         print(f"총 수용 가능: {sum(driver_max_capas)}건")
         
-        # weight 처리
         if 'weight' not in df.columns:
             df['weight'] = DEFAULT_WEIGHT_KG
         df['weight'] = pd.to_numeric(df['weight'], errors='coerce').fillna(DEFAULT_WEIGHT_KG).astype(int)
         df.loc[depot_idx, 'weight'] = 0
         
-        # 2. ★ V10.3: K-Means 사전 클러스터링 ★
-        print(f"\n=== 지리적 클러스터링 (K-Means) ===")
+        # 2. K-Means 사전 클러스터링
+        print(f"\n=== 1단계: K-Means 클러스터링 ===")
         node_to_cluster, cluster_centers = create_geographic_clusters(df, num_vehicles, depot_idx)
         
-        # 클러스터별 노드 수 출력
         cluster_node_counts = {}
         for node_idx, cluster_id in node_to_cluster.items():
             cluster_node_counts[cluster_id] = cluster_node_counts.get(cluster_id, 0) + 1
-        print(f"K-Means 클러스터별 노드 수: {cluster_node_counts}")
+        print(f"K-Means 결과: {cluster_node_counts}")
         
-        # 3. 거리 행렬
+        # 3. ★ V10.4: Convex Hull 생성 ★
+        print(f"\n=== 2단계: Convex Hull 생성 ===")
+        cluster_hulls = create_convex_hulls(df, node_to_cluster, num_vehicles, depot_idx)
+        
+        # 4. ★ V10.4: Convex Hull 경계 기반 재할당 ★
+        node_to_cluster = enforce_convex_hull_boundaries(df, node_to_cluster, cluster_hulls, num_vehicles, depot_idx)
+        
+        # 재할당 후 클러스터별 노드 수
+        cluster_node_counts_after = {}
+        for node_idx, cluster_id in node_to_cluster.items():
+            cluster_node_counts_after[cluster_id] = cluster_node_counts_after.get(cluster_id, 0) + 1
+        print(f"Convex Hull 보정 후: {cluster_node_counts_after}")
+        
+        # 5. 거리 행렬
         dist_matrix = create_distance_matrix(df)
         
-        # 4. OR-Tools CVRP 설정
+        # 6. OR-Tools 설정
         manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, depot_idx)
         routing = pywrapcp.RoutingModel(manager)
         
@@ -367,74 +527,63 @@ def optimize_routes(body: RequestBody):
         transit_callback_index = routing.RegisterTransitCallback(distance_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
         
-        # 미배정 페널티 (용량 초과 시 일부 미배정 허용)
         UNASSIGNED_PENALTY = 10000000000
         for node_idx in range(1, num_locations):
             index = manager.NodeToIndex(node_idx)
             routing.AddDisjunction([index], UNASSIGNED_PENALTY)
         
-        # 적재량 제한 (기사별)
         def demand_callback(from_index):
             from_node = manager.IndexToNode(from_index)
             return int(df.iloc[from_node]['weight'])
         
         demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
         routing.AddDimensionWithVehicleCapacity(
-            demand_callback_index, 0,
-            driver_kg_capas,
-            True, 'Capacity'
-        )
+            demand_callback_index, 0, driver_kg_capas, True, 'Capacity')
         
-        # 콜 수 제한 (기사별 max_capa 하드캡)
         def count_callback(from_index):
             from_node = manager.IndexToNode(from_index)
             return 0 if from_node == depot_idx else 1
         
         count_callback_index = routing.RegisterUnaryTransitCallback(count_callback)
         routing.AddDimensionWithVehicleCapacity(
-            count_callback_index, 0,
-            driver_max_capas,
-            True, 'CallCount'
-        )
+            count_callback_index, 0, driver_max_capas, True, 'CallCount')
         
-        # 5. ★ V10.3 핵심: Same Vehicle Constraint ★
-        # 같은 K-Means 클러스터에 속한 노드들은 같은 차량에 배정되도록 강제
-        print(f"\n=== Same Vehicle Constraint 적용 ===")
+        # 7. ★ V10.4: Same Vehicle Constraint (90% 핵심 노드) ★
+        print(f"\n=== 3단계: Same Vehicle Constraint (핵심 노드 {int(CORE_NODE_RATIO*100)}%) ===")
         
-        # 클러스터별 노드 인덱스 그룹화
         cluster_to_nodes = {}
         for node_idx, cluster_id in node_to_cluster.items():
             if cluster_id not in cluster_to_nodes:
                 cluster_to_nodes[cluster_id] = []
             cluster_to_nodes[cluster_id].append(node_idx)
         
-        # ★ 핵심: 각 클러스터 내 인접 노드쌍에 Same Vehicle Constraint 적용 ★
-        # 전체 노드에 적용하면 너무 빡빡해서, 클러스터 중심에 가까운 "핵심 노드"들만 연결
         constraints_added = 0
         
         for cluster_id, nodes in cluster_to_nodes.items():
             if len(nodes) < 2:
                 continue
             
-            # 클러스터 중심점
-            center = cluster_centers[cluster_id]
+            # 클러스터 중심점 계산
+            center_lat = np.mean([float(df.iloc[n]['lat']) for n in nodes])
+            center_lon = np.mean([float(df.iloc[n]['lon']) for n in nodes])
             
             # 중심에 가까운 순으로 정렬
             nodes_with_dist = []
             for node_idx in nodes:
                 node_lat = float(df.iloc[node_idx]['lat'])
                 node_lon = float(df.iloc[node_idx]['lon'])
-                dist = haversine(node_lat, node_lon, center[0], center[1])
+                dist = haversine(node_lat, node_lon, center_lat, center_lon)
                 nodes_with_dist.append((node_idx, dist))
             
             nodes_with_dist.sort(key=lambda x: x[1])
             
-            # 상위 70% 노드를 "핵심 노드"로 선정 (너무 외곽은 유연하게)
-            core_count = max(2, int(len(nodes) * 0.7))
+            # ★ V10.4: 90% 핵심 노드 ★
+            core_count = max(2, int(len(nodes) * CORE_NODE_RATIO))
             core_nodes = [n[0] for n in nodes_with_dist[:core_count]]
             
-            # 핵심 노드들 간에 Same Vehicle Constraint 적용
-            # 체인 방식: A-B, B-C, C-D... (모든 쌍 연결하면 과도한 제약)
+            print(f"  클러스터 {cluster_id}: 전체 {len(nodes)}개 중 핵심 {len(core_nodes)}개")
+            
+            # 체인 방식으로 Same Vehicle Constraint 적용
             for i in range(len(core_nodes) - 1):
                 node_a = core_nodes[i]
                 node_b = core_nodes[i + 1]
@@ -442,14 +591,13 @@ def optimize_routes(body: RequestBody):
                 index_a = manager.NodeToIndex(node_a)
                 index_b = manager.NodeToIndex(node_b)
                 
-                # Same Vehicle Constraint: 두 노드가 같은 차량에 배정되어야 함
                 routing.AddPickupAndDelivery(index_a, index_b)
                 routing.solver().Add(
                     routing.VehicleVar(index_a) == routing.VehicleVar(index_b)
                 )
                 constraints_added += 1
         
-        print(f"Same Vehicle Constraints 추가: {constraints_added}개")
+        print(f"  총 Same Vehicle Constraints: {constraints_added}개")
         
         # 콜 수 하한 (소프트)
         count_dimension = routing.GetDimensionOrDie('CallCount')
@@ -464,22 +612,21 @@ def optimize_routes(body: RequestBody):
         distance_dimension = routing.GetDimensionOrDie('Distance')
         distance_dimension.SetGlobalSpanCostCoefficient(200)
         
-        # 6. 검색 전략
+        # 8. 검색
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = (
             routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
         search_parameters.local_search_metaheuristic = (
             routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
-        search_parameters.time_limit.seconds = 30
+        search_parameters.time_limit.seconds = 45  # 제약 많아서 시간 증가
         
+        print(f"\n=== 4단계: OR-Tools 최적화 ===")
         solution = routing.SolveWithParameters(search_parameters)
         
         if not solution:
-            # Same Vehicle Constraint가 너무 빡빡하면 실패할 수 있음
-            # Fallback: 제약 없이 다시 시도
             print("⚠️ Same Vehicle Constraint로 해 찾기 실패, Fallback 시도...")
             
-            # 새로운 모델 생성 (제약 없이)
+            # Fallback: 제약 완화 (70%로 낮추고 재시도)
             manager2 = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, depot_idx)
             routing2 = pywrapcp.RoutingModel(manager2)
             
@@ -498,6 +645,40 @@ def optimize_routes(body: RequestBody):
             routing2.AddDimensionWithVehicleCapacity(
                 count_callback_index2, 0, driver_max_capas, True, 'CallCount')
             
+            # 70% 핵심 노드로 재시도
+            constraints_added_fallback = 0
+            for cluster_id, nodes in cluster_to_nodes.items():
+                if len(nodes) < 2:
+                    continue
+                
+                center_lat = np.mean([float(df.iloc[n]['lat']) for n in nodes])
+                center_lon = np.mean([float(df.iloc[n]['lon']) for n in nodes])
+                
+                nodes_with_dist = []
+                for node_idx in nodes:
+                    node_lat = float(df.iloc[node_idx]['lat'])
+                    node_lon = float(df.iloc[node_idx]['lon'])
+                    dist = haversine(node_lat, node_lon, center_lat, center_lon)
+                    nodes_with_dist.append((node_idx, dist))
+                
+                nodes_with_dist.sort(key=lambda x: x[1])
+                
+                core_count = max(2, int(len(nodes) * 0.7))  # 70%로 완화
+                core_nodes = [n[0] for n in nodes_with_dist[:core_count]]
+                
+                for i in range(len(core_nodes) - 1):
+                    node_a = core_nodes[i]
+                    node_b = core_nodes[i + 1]
+                    
+                    index_a = manager2.NodeToIndex(node_a)
+                    index_b = manager2.NodeToIndex(node_b)
+                    
+                    routing2.AddPickupAndDelivery(index_a, index_b)
+                    routing2.solver().Add(
+                        routing2.VehicleVar(index_a) == routing2.VehicleVar(index_b)
+                    )
+                    constraints_added_fallback += 1
+            
             solution = routing2.SolveWithParameters(search_parameters)
             manager = manager2
             routing = routing2
@@ -505,15 +686,15 @@ def optimize_routes(body: RequestBody):
             if not solution:
                 return {
                     "status": "fail",
-                    "message": "Solution not found. 적재량/콜수 제약 확인 필요.",
+                    "message": "Solution not found. 제약 조건 충돌.",
                     "debug": {
                         "total_calls": num_locations - 1,
                         "total_max_capa": sum(driver_max_capas),
-                        "driver_max_capas": driver_max_capas
+                        "constraints_tried": constraints_added
                     }
                 }
         
-        # 7. 클러스터 추출
+        # 9. 결과 추출
         cluster_assignments = {}
         
         for cluster_id in range(num_vehicles):
@@ -524,15 +705,15 @@ def optimize_routes(body: RequestBody):
                     cluster_assignments[node_idx] = cluster_id
                 index = solution.Value(routing.NextVar(index))
         
-        # 8. 클러스터-기사 매칭 (V10.2 로직)
-        print("\n=== 클러스터-기사 매칭 (V10.2) ===")
+        # 10. 클러스터-기사 매칭
+        print("\n=== 5단계: 클러스터-기사 매칭 ===")
         if use_driver_features:
             cluster_to_driver = match_clusters_to_drivers_v2(
                 df, cluster_assignments, drivers, num_vehicles, depot_idx)
         else:
             cluster_to_driver = {i: i for i in range(num_vehicles)}
         
-        # 9. 결과 생성
+        # 11. 결과 생성
         results = []
         stats = []
         total_distance = 0
@@ -608,12 +789,12 @@ def optimize_routes(body: RequestBody):
         all_ids = set(str(df.iloc[i]['id']) for i in range(1, len(df)))
         unassigned_ids = all_ids - assigned_ids
         
-        # 클러스터 교차 검증
-        cluster_overlap = check_cluster_overlap(df, cluster_assignments, num_vehicles)
+        # 클러스터 교차 점수
+        overlap_score = check_cluster_overlap(df, cluster_assignments, num_vehicles)
         
         print(f"\n=== 최적화 완료 ===")
         print(f"배정: {len(results)}건, 미배정: {len(unassigned_ids)}건")
-        print(f"클러스터 교차: {cluster_overlap}")
+        print(f"클러스터 교차 점수: {overlap_score}%")
         
         return {
             "status": "success",
@@ -628,9 +809,10 @@ def optimize_routes(body: RequestBody):
                 "avg_distance_km": round(total_distance / num_vehicles, 2) if num_vehicles > 0 else 0
             },
             "optimization_info": {
-                "algorithm": "V10.3: K-Means + Same Vehicle Constraint",
+                "algorithm": "V10.4: K-Means + Convex Hull + Same Vehicle (90%)",
                 "same_vehicle_constraints": constraints_added,
-                "cluster_overlap_score": cluster_overlap,
+                "cluster_overlap_score": overlap_score,
+                "core_node_ratio": CORE_NODE_RATIO,
                 "use_driver_features": use_driver_features
             },
             "matching_info": {
@@ -646,56 +828,6 @@ def optimize_routes(body: RequestBody):
             "message": str(e),
             "traceback": traceback.format_exc()
         }
-
-
-def check_cluster_overlap(df, assignments, num_clusters):
-    """
-    클러스터 간 지리적 교차 정도 측정
-    
-    방법: 각 노드가 자신의 클러스터 중심보다 다른 클러스터 중심에 더 가까운 비율
-    낮을수록 좋음 (0% = 완벽한 분리)
-    """
-    # 클러스터 중심점 계산
-    centroids = {}
-    for cluster_id in range(num_clusters):
-        centroid = calculate_cluster_centroid(df, assignments, cluster_id)
-        if centroid:
-            centroids[cluster_id] = centroid
-    
-    if len(centroids) < 2:
-        return 0.0
-    
-    overlap_count = 0
-    total_count = 0
-    
-    for node_idx, assigned_cluster in assignments.items():
-        if assigned_cluster not in centroids:
-            continue
-        
-        node_lat = float(df.iloc[node_idx]['lat'])
-        node_lon = float(df.iloc[node_idx]['lon'])
-        
-        own_centroid = centroids[assigned_cluster]
-        own_dist = haversine(node_lat, node_lon, own_centroid[0], own_centroid[1])
-        
-        # 다른 클러스터 중심과의 거리 중 최소값
-        min_other_dist = float('inf')
-        for other_cluster, other_centroid in centroids.items():
-            if other_cluster == assigned_cluster:
-                continue
-            other_dist = haversine(node_lat, node_lon, other_centroid[0], other_centroid[1])
-            min_other_dist = min(min_other_dist, other_dist)
-        
-        # 다른 클러스터 중심이 더 가까우면 "교차"로 판정
-        if min_other_dist < own_dist:
-            overlap_count += 1
-        
-        total_count += 1
-    
-    if total_count == 0:
-        return 0.0
-    
-    return round(overlap_count / total_count * 100, 1)
 
 
 if __name__ == "__main__":
