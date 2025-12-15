@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import traceback
 from typing import Optional, List
+from sklearn.cluster import KMeans
 
 app = FastAPI()
 
@@ -94,19 +95,47 @@ def get_cluster_stats(df, assignments, vehicle_id):
     }
 
 
+def create_geographic_clusters(df, num_clusters, depot_idx=0):
+    """
+    ★ V10.3 신규: K-Means 기반 지리적 클러스터링 ★
+    
+    목적: 
+    - 지리적으로 가까운 노드들을 같은 그룹으로 묶음
+    - OR-Tools에 "같은 그룹은 같은 차량" 힌트 제공
+    
+    Returns:
+        node_to_cluster: {node_idx: cluster_id} 매핑
+    """
+    # depot 제외한 좌표 추출
+    coords = []
+    node_indices = []
+    
+    for i in range(len(df)):
+        if i == depot_idx:
+            continue
+        coords.append([df.iloc[i]['lat'], df.iloc[i]['lon']])
+        node_indices.append(i)
+    
+    if len(coords) < num_clusters:
+        # 노드가 클러스터 수보다 적으면 각자 별도 클러스터
+        return {idx: i % num_clusters for i, idx in enumerate(node_indices)}
+    
+    # K-Means 클러스터링
+    coords_array = np.array(coords)
+    kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(coords_array)
+    
+    # 결과 매핑
+    node_to_cluster = {}
+    for i, node_idx in enumerate(node_indices):
+        node_to_cluster[node_idx] = int(labels[i])
+    
+    return node_to_cluster, kmeans.cluster_centers_
+
+
 def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_idx=0):
     """
-    ★ V10.2 신규: max_capa를 고려한 클러스터-기사 매칭 ★
-    
-    기존 문제점:
-    - 거점 거리만 고려해서 매칭
-    - max_capa가 20인 기사가 콜 10개 클러스터에, max_capa가 10인 기사가 콜 20개 클러스터에 매칭되는 문제
-    
-    해결 방안:
-    1. 각 클러스터의 콜 수 계산
-    2. 기사의 max_capa가 클러스터 콜 수보다 작으면 매칭 후보에서 제외
-    3. 적합한 후보 중에서 거점 거리가 가장 가까운 기사 선택
-    4. 적합한 후보가 없으면 max_capa가 가장 큰 기사 선택 (차선책)
+    V10.2: max_capa를 고려한 클러스터-기사 매칭
     """
     
     # 1. 클러스터별 통계 계산
@@ -139,12 +168,11 @@ def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_i
         }
         print(f"  기사 {i} ({driver.name}): max_capa={max_capa}")
     
-    # 4. ★ 핵심 로직: max_capa를 고려한 매칭 ★
+    # 4. max_capa를 고려한 매칭
     cluster_to_driver = {}
     used_drivers = set()
     
-    # 클러스터를 콜 수 내림차순으로 정렬 (콜 수 많은 클러스터부터 처리)
-    # → max_capa가 큰 기사를 먼저 배정받을 수 있도록
+    # 클러스터를 콜 수 내림차순으로 정렬
     sorted_clusters = sorted(
         cluster_stats.keys(),
         key=lambda c: cluster_stats[c]['call_count'],
@@ -160,29 +188,26 @@ def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_i
         cluster_calls = cluster_stats[cluster_id]['call_count']
         centroid = cluster_centroids[cluster_id]
         
-        # 적합한 기사 후보 찾기 (max_capa >= 클러스터 콜 수)
+        # 적합한 기사 후보 찾기
         candidates = []
         for driver_id, info in driver_info.items():
             if driver_id in used_drivers:
                 continue
             
-            # ★ 핵심: max_capa가 클러스터 콜 수 이상인 기사만 후보로
             if info['max_capa'] >= cluster_calls:
                 dist = haversine(centroid[0], centroid[1], info['base'][0], info['base'][1])
                 candidates.append((driver_id, dist, info['max_capa']))
         
         if candidates:
-            # 적합한 후보 중 거리가 가장 가까운 기사 선택
-            candidates.sort(key=lambda x: x[1])  # 거리순 정렬
+            candidates.sort(key=lambda x: x[1])
             best_driver = candidates[0][0]
             print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}, max_capa={driver_info[best_driver]['max_capa']}) [거리 기반]")
         else:
-            # 적합한 후보가 없으면 남은 기사 중 max_capa가 가장 큰 기사 선택
             remaining = [(d, info['max_capa']) for d, info in driver_info.items() if d not in used_drivers]
             if remaining:
-                remaining.sort(key=lambda x: -x[1])  # max_capa 내림차순
+                remaining.sort(key=lambda x: -x[1])
                 best_driver = remaining[0][0]
-                print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}, max_capa={driver_info[best_driver]['max_capa']}) [차선책: 적합 후보 없음]")
+                print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 {best_driver} ({driver_info[best_driver]['name']}, max_capa={driver_info[best_driver]['max_capa']}) [차선책]")
             else:
                 best_driver = 0
                 print(f"  클러스터 {cluster_id} ({cluster_calls}건) → 기사 0 [fallback]")
@@ -190,7 +215,7 @@ def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_i
         cluster_to_driver[cluster_id] = best_driver
         used_drivers.add(best_driver)
     
-    # 매칭 안 된 클러스터 처리 (빈 클러스터 등)
+    # 매칭 안 된 클러스터 처리
     remaining_drivers = set(range(len(drivers))) - used_drivers
     for cluster_id in range(num_clusters):
         if cluster_id not in cluster_to_driver:
@@ -203,172 +228,8 @@ def match_clusters_to_drivers_v2(df, assignments, drivers, num_clusters, depot_i
     return cluster_to_driver
 
 
-def smart_swap_optimization(df, assignments, num_clusters, driver_capacities, depot_idx=0):
-    """상식적 교환 최적화"""
-    assignments = dict(assignments)
-    swaps_made = 0
-    max_iterations = 5
-    
-    try:
-        for iteration in range(max_iterations):
-            made_swap_this_round = False
-            
-            centroids = {}
-            for vid in range(num_clusters):
-                centroid = calculate_cluster_centroid(df, assignments, vid)
-                if centroid is not None:
-                    centroids[vid] = centroid
-            
-            if not centroids:
-                break
-            
-            nodes_to_check = list(assignments.keys())
-            
-            for node_idx in nodes_to_check:
-                if node_idx == depot_idx or node_idx not in assignments:
-                    continue
-                
-                current_cluster = assignments[node_idx]
-                
-                if current_cluster not in centroids:
-                    continue
-                
-                try:
-                    node_lat = float(df.iloc[node_idx]['lat'])
-                    node_lon = float(df.iloc[node_idx]['lon'])
-                except:
-                    continue
-                
-                current_centroid = centroids[current_cluster]
-                current_dist = haversine(node_lat, node_lon, 
-                                        current_centroid[0], current_centroid[1])
-                
-                if current_dist == 0:
-                    continue
-                
-                best_alternative = None
-                best_alternative_dist = current_dist
-                
-                for other_cluster in range(num_clusters):
-                    if other_cluster == current_cluster or other_cluster not in centroids:
-                        continue
-                    
-                    other_centroid = centroids[other_cluster]
-                    other_dist = haversine(node_lat, node_lon,
-                                          other_centroid[0], other_centroid[1])
-                    
-                    if other_dist < current_dist * 0.7 and other_dist < best_alternative_dist:
-                        best_alternative = other_cluster
-                        best_alternative_dist = other_dist
-                
-                if best_alternative is not None:
-                    current_stats = get_cluster_stats(df, assignments, current_cluster)
-                    target_stats = get_cluster_stats(df, assignments, best_alternative)
-                    
-                    can_swap = True
-                    
-                    target_max_capa = driver_capacities.get(best_alternative, DEFAULT_MAX_CAPA)
-                    if target_stats['call_count'] + 1 > target_max_capa:
-                        can_swap = False
-                    
-                    if current_stats['call_count'] - 1 < MIN_CALLS_SOFT:
-                        if current_stats['call_count'] >= MIN_CALLS_SOFT:
-                            can_swap = False
-                    
-                    if can_swap:
-                        assignments[node_idx] = best_alternative
-                        swaps_made += 1
-                        made_swap_this_round = True
-            
-            if not made_swap_this_round:
-                break
-                
-    except Exception as e:
-        print(f"smart_swap error: {e}")
-    
-    return assignments, swaps_made
-
-
-def mutual_swap_optimization(df, assignments, num_clusters, depot_idx=0):
-    """상호 교환 최적화"""
-    assignments = dict(assignments)
-    swaps_made = 0
-    
-    try:
-        centroids = {}
-        for vid in range(num_clusters):
-            centroid = calculate_cluster_centroid(df, assignments, vid)
-            if centroid is not None:
-                centroids[vid] = centroid
-        
-        if len(centroids) < 2:
-            return assignments, swaps_made
-        
-        for vid_a in range(num_clusters):
-            for vid_b in range(vid_a + 1, num_clusters):
-                if vid_a not in centroids or vid_b not in centroids:
-                    continue
-                
-                indices_a = [idx for idx, vid in assignments.items() if vid == vid_a and idx != depot_idx]
-                indices_b = [idx for idx, vid in assignments.items() if vid == vid_b and idx != depot_idx]
-                
-                if not indices_a or not indices_b:
-                    continue
-                
-                a_to_b_candidates = []
-                for idx in indices_a:
-                    try:
-                        node_lat = float(df.iloc[idx]['lat'])
-                        node_lon = float(df.iloc[idx]['lon'])
-                        dist_to_a = haversine(node_lat, node_lon, centroids[vid_a][0], centroids[vid_a][1])
-                        dist_to_b = haversine(node_lat, node_lon, centroids[vid_b][0], centroids[vid_b][1])
-                        if dist_to_b < dist_to_a:
-                            a_to_b_candidates.append((idx, dist_to_a - dist_to_b))
-                    except:
-                        continue
-                
-                b_to_a_candidates = []
-                for idx in indices_b:
-                    try:
-                        node_lat = float(df.iloc[idx]['lat'])
-                        node_lon = float(df.iloc[idx]['lon'])
-                        dist_to_a = haversine(node_lat, node_lon, centroids[vid_a][0], centroids[vid_a][1])
-                        dist_to_b = haversine(node_lat, node_lon, centroids[vid_b][0], centroids[vid_b][1])
-                        if dist_to_a < dist_to_b:
-                            b_to_a_candidates.append((idx, dist_to_b - dist_to_a))
-                    except:
-                        continue
-                
-                if not a_to_b_candidates or not b_to_a_candidates:
-                    continue
-                
-                a_to_b_candidates.sort(key=lambda x: -x[1])
-                b_to_a_candidates.sort(key=lambda x: -x[1])
-                
-                for a_cand in a_to_b_candidates[:3]:
-                    for b_cand in b_to_a_candidates[:3]:
-                        idx_a = a_cand[0]
-                        idx_b = b_cand[0]
-                        
-                        if assignments.get(idx_a) != vid_a or assignments.get(idx_b) != vid_b:
-                            continue
-                        
-                        assignments[idx_a] = vid_b
-                        assignments[idx_b] = vid_a
-                        swaps_made += 1
-                        break
-                    else:
-                        continue
-                    break
-                    
-    except Exception as e:
-        print(f"mutual_swap error: {e}")
-    
-    return assignments, swaps_made
-
-
 def optimize_visit_order(df, assignments, cluster_id, depot_idx=0):
-    """클러스터별 방문 순서 최적화"""
+    """클러스터별 방문 순서 최적화 (Nearest Neighbor)"""
     assigned_indices = [idx for idx, vid in assignments.items() if vid == cluster_id and idx != depot_idx]
     
     if len(assigned_indices) <= 1:
@@ -403,16 +264,17 @@ def optimize_visit_order(df, assignments, cluster_id, depot_idx=0):
 def read_root():
     return {
         "status": "active",
-        "message": "VRP Engine V10.2 (Capacity-Aware Matching)",
+        "message": "VRP Engine V10.3 (Geographic Clustering + Same Route Constraint)",
         "features": [
-            "drivers 필드 선택적 (없으면 num_vehicles 사용)",
+            "drivers 필드 선택적",
             "기사별 max_capa 하드캡",
-            "★ V10.2: max_capa 고려한 클러스터-기사 매칭",
-            "콜 수 많은 클러스터 → max_capa 큰 기사 우선 배정",
-            "Smart Swap / Mutual Swap 후처리"
+            "★ V10.3: K-Means 사전 클러스터링으로 지리적 그룹화",
+            "★ V10.3: Same Vehicle Constraint로 클러스터 교차 방지",
+            "max_capa 고려한 클러스터-기사 매칭"
         ],
         "changelog": {
-            "v10.2": "클러스터-기사 매칭 시 max_capa 제약 추가. 콜 수 초과 매칭 방지."
+            "v10.3": "K-Means + Same Vehicle Constraint로 클러스터 간 교차 제거",
+            "v10.2": "클러스터-기사 매칭 시 max_capa 제약 추가"
         }
     }
 
@@ -420,7 +282,12 @@ def read_root():
 @app.post("/optimize")
 def optimize_routes(body: RequestBody):
     """
-    OR-Tools CVRP + 기사별 제약 + ★ max_capa 고려 매칭 ★
+    OR-Tools CVRP + ★ V10.3: 지리적 클러스터링 + Same Vehicle Constraint ★
+    
+    핵심 변경:
+    1. K-Means로 먼저 지리적 클러스터 생성
+    2. 같은 클러스터 내 노드들에 Same Vehicle Constraint 적용
+    3. OR-Tools가 클러스터 경계를 존중하면서 최적화
     """
     
     try:
@@ -464,7 +331,7 @@ def optimize_routes(body: RequestBody):
             driver_max_capas.append(max_capa)
             driver_kg_capas.append(kg_capa)
         
-        print(f"\n=== VRP V10.2 최적화 시작 ===")
+        print(f"\n=== VRP V10.3 최적화 시작 ===")
         print(f"총 위치: {num_locations}개, 기사: {num_vehicles}명")
         print(f"기사별 max_capa: {driver_max_capas}")
         print(f"총 수용 가능: {sum(driver_max_capas)}건")
@@ -475,10 +342,20 @@ def optimize_routes(body: RequestBody):
         df['weight'] = pd.to_numeric(df['weight'], errors='coerce').fillna(DEFAULT_WEIGHT_KG).astype(int)
         df.loc[depot_idx, 'weight'] = 0
         
-        # 2. 거리 행렬
+        # 2. ★ V10.3: K-Means 사전 클러스터링 ★
+        print(f"\n=== 지리적 클러스터링 (K-Means) ===")
+        node_to_cluster, cluster_centers = create_geographic_clusters(df, num_vehicles, depot_idx)
+        
+        # 클러스터별 노드 수 출력
+        cluster_node_counts = {}
+        for node_idx, cluster_id in node_to_cluster.items():
+            cluster_node_counts[cluster_id] = cluster_node_counts.get(cluster_id, 0) + 1
+        print(f"K-Means 클러스터별 노드 수: {cluster_node_counts}")
+        
+        # 3. 거리 행렬
         dist_matrix = create_distance_matrix(df)
         
-        # 3. OR-Tools CVRP
+        # 4. OR-Tools CVRP 설정
         manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, depot_idx)
         routing = pywrapcp.RoutingModel(manager)
         
@@ -490,7 +367,7 @@ def optimize_routes(body: RequestBody):
         transit_callback_index = routing.RegisterTransitCallback(distance_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
         
-        # 미배정 방지
+        # 미배정 페널티 (용량 초과 시 일부 미배정 허용)
         UNASSIGNED_PENALTY = 10000000000
         for node_idx in range(1, num_locations):
             index = manager.NodeToIndex(node_idx)
@@ -520,6 +397,60 @@ def optimize_routes(body: RequestBody):
             True, 'CallCount'
         )
         
+        # 5. ★ V10.3 핵심: Same Vehicle Constraint ★
+        # 같은 K-Means 클러스터에 속한 노드들은 같은 차량에 배정되도록 강제
+        print(f"\n=== Same Vehicle Constraint 적용 ===")
+        
+        # 클러스터별 노드 인덱스 그룹화
+        cluster_to_nodes = {}
+        for node_idx, cluster_id in node_to_cluster.items():
+            if cluster_id not in cluster_to_nodes:
+                cluster_to_nodes[cluster_id] = []
+            cluster_to_nodes[cluster_id].append(node_idx)
+        
+        # ★ 핵심: 각 클러스터 내 인접 노드쌍에 Same Vehicle Constraint 적용 ★
+        # 전체 노드에 적용하면 너무 빡빡해서, 클러스터 중심에 가까운 "핵심 노드"들만 연결
+        constraints_added = 0
+        
+        for cluster_id, nodes in cluster_to_nodes.items():
+            if len(nodes) < 2:
+                continue
+            
+            # 클러스터 중심점
+            center = cluster_centers[cluster_id]
+            
+            # 중심에 가까운 순으로 정렬
+            nodes_with_dist = []
+            for node_idx in nodes:
+                node_lat = float(df.iloc[node_idx]['lat'])
+                node_lon = float(df.iloc[node_idx]['lon'])
+                dist = haversine(node_lat, node_lon, center[0], center[1])
+                nodes_with_dist.append((node_idx, dist))
+            
+            nodes_with_dist.sort(key=lambda x: x[1])
+            
+            # 상위 70% 노드를 "핵심 노드"로 선정 (너무 외곽은 유연하게)
+            core_count = max(2, int(len(nodes) * 0.7))
+            core_nodes = [n[0] for n in nodes_with_dist[:core_count]]
+            
+            # 핵심 노드들 간에 Same Vehicle Constraint 적용
+            # 체인 방식: A-B, B-C, C-D... (모든 쌍 연결하면 과도한 제약)
+            for i in range(len(core_nodes) - 1):
+                node_a = core_nodes[i]
+                node_b = core_nodes[i + 1]
+                
+                index_a = manager.NodeToIndex(node_a)
+                index_b = manager.NodeToIndex(node_b)
+                
+                # Same Vehicle Constraint: 두 노드가 같은 차량에 배정되어야 함
+                routing.AddPickupAndDelivery(index_a, index_b)
+                routing.solver().Add(
+                    routing.VehicleVar(index_a) == routing.VehicleVar(index_b)
+                )
+                constraints_added += 1
+        
+        print(f"Same Vehicle Constraints 추가: {constraints_added}개")
+        
         # 콜 수 하한 (소프트)
         count_dimension = routing.GetDimensionOrDie('CallCount')
         CALL_PENALTY = 50000
@@ -533,7 +464,7 @@ def optimize_routes(body: RequestBody):
         distance_dimension = routing.GetDimensionOrDie('Distance')
         distance_dimension.SetGlobalSpanCostCoefficient(200)
         
-        # 검색 전략
+        # 6. 검색 전략
         search_parameters = pywrapcp.DefaultRoutingSearchParameters()
         search_parameters.first_solution_strategy = (
             routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
@@ -544,19 +475,45 @@ def optimize_routes(body: RequestBody):
         solution = routing.SolveWithParameters(search_parameters)
         
         if not solution:
-            return {
-                "status": "fail",
-                "message": "Solution not found. 적재량/콜수 제약 확인 필요.",
-                "debug": {
-                    "total_calls": num_locations - 1,
-                    "total_max_capa": sum(driver_max_capas),
-                    "driver_max_capas": driver_max_capas,
-                    "total_weight": int(df['weight'].sum()),
-                    "total_kg_capacity": sum(driver_kg_capas)
+            # Same Vehicle Constraint가 너무 빡빡하면 실패할 수 있음
+            # Fallback: 제약 없이 다시 시도
+            print("⚠️ Same Vehicle Constraint로 해 찾기 실패, Fallback 시도...")
+            
+            # 새로운 모델 생성 (제약 없이)
+            manager2 = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, depot_idx)
+            routing2 = pywrapcp.RoutingModel(manager2)
+            
+            transit_callback_index2 = routing2.RegisterTransitCallback(distance_callback)
+            routing2.SetArcCostEvaluatorOfAllVehicles(transit_callback_index2)
+            
+            for node_idx in range(1, num_locations):
+                index = manager2.NodeToIndex(node_idx)
+                routing2.AddDisjunction([index], UNASSIGNED_PENALTY)
+            
+            demand_callback_index2 = routing2.RegisterUnaryTransitCallback(demand_callback)
+            routing2.AddDimensionWithVehicleCapacity(
+                demand_callback_index2, 0, driver_kg_capas, True, 'Capacity')
+            
+            count_callback_index2 = routing2.RegisterUnaryTransitCallback(count_callback)
+            routing2.AddDimensionWithVehicleCapacity(
+                count_callback_index2, 0, driver_max_capas, True, 'CallCount')
+            
+            solution = routing2.SolveWithParameters(search_parameters)
+            manager = manager2
+            routing = routing2
+            
+            if not solution:
+                return {
+                    "status": "fail",
+                    "message": "Solution not found. 적재량/콜수 제약 확인 필요.",
+                    "debug": {
+                        "total_calls": num_locations - 1,
+                        "total_max_capa": sum(driver_max_capas),
+                        "driver_max_capas": driver_max_capas
+                    }
                 }
-            }
         
-        # 4. 클러스터 추출
+        # 7. 클러스터 추출
         cluster_assignments = {}
         
         for cluster_id in range(num_vehicles):
@@ -567,18 +524,7 @@ def optimize_routes(body: RequestBody):
                     cluster_assignments[node_idx] = cluster_id
                 index = solution.Value(routing.NextVar(index))
         
-        # 5. Smart Swap 후처리
-        cluster_capa_map = {i: driver_max_capas[i] for i in range(num_vehicles)}
-        cluster_assignments, smart_swaps = smart_swap_optimization(
-            df, cluster_assignments, num_vehicles, cluster_capa_map, depot_idx)
-        
-        # 6. Mutual Swap 후처리
-        cluster_assignments, mutual_swaps = mutual_swap_optimization(
-            df, cluster_assignments, num_vehicles, depot_idx)
-        
-        total_swaps = smart_swaps + mutual_swaps
-        
-        # 7. ★ V10.2: max_capa 고려한 클러스터-기사 매칭 ★
+        # 8. 클러스터-기사 매칭 (V10.2 로직)
         print("\n=== 클러스터-기사 매칭 (V10.2) ===")
         if use_driver_features:
             cluster_to_driver = match_clusters_to_drivers_v2(
@@ -586,7 +532,7 @@ def optimize_routes(body: RequestBody):
         else:
             cluster_to_driver = {i: i for i in range(num_vehicles)}
         
-        # 8. 결과 생성
+        # 9. 결과 생성
         results = []
         stats = []
         total_distance = 0
@@ -623,7 +569,6 @@ def optimize_routes(body: RequestBody):
                     print(f"Error processing node {node_idx}: {e}")
                     continue
             
-            # depot 복귀
             if visit_order:
                 route_distance += haversine(prev_lat, prev_lon,
                                            float(df.iloc[depot_idx]['lat']),
@@ -663,8 +608,12 @@ def optimize_routes(body: RequestBody):
         all_ids = set(str(df.iloc[i]['id']) for i in range(1, len(df)))
         unassigned_ids = all_ids - assigned_ids
         
+        # 클러스터 교차 검증
+        cluster_overlap = check_cluster_overlap(df, cluster_assignments, num_vehicles)
+        
         print(f"\n=== 최적화 완료 ===")
         print(f"배정: {len(results)}건, 미배정: {len(unassigned_ids)}건")
+        print(f"클러스터 교차: {cluster_overlap}")
         
         return {
             "status": "success",
@@ -679,11 +628,10 @@ def optimize_routes(body: RequestBody):
                 "avg_distance_km": round(total_distance / num_vehicles, 2) if num_vehicles > 0 else 0
             },
             "optimization_info": {
-                "smart_swaps": smart_swaps,
-                "mutual_swaps": mutual_swaps,
-                "total_swaps": total_swaps,
-                "use_driver_features": use_driver_features,
-                "message": f"후처리로 {total_swaps}건 재배정"
+                "algorithm": "V10.3: K-Means + Same Vehicle Constraint",
+                "same_vehicle_constraints": constraints_added,
+                "cluster_overlap_score": cluster_overlap,
+                "use_driver_features": use_driver_features
             },
             "matching_info": {
                 "cluster_to_driver": {f"클러스터{k}": drivers[v].name for k, v in cluster_to_driver.items()},
@@ -698,6 +646,56 @@ def optimize_routes(body: RequestBody):
             "message": str(e),
             "traceback": traceback.format_exc()
         }
+
+
+def check_cluster_overlap(df, assignments, num_clusters):
+    """
+    클러스터 간 지리적 교차 정도 측정
+    
+    방법: 각 노드가 자신의 클러스터 중심보다 다른 클러스터 중심에 더 가까운 비율
+    낮을수록 좋음 (0% = 완벽한 분리)
+    """
+    # 클러스터 중심점 계산
+    centroids = {}
+    for cluster_id in range(num_clusters):
+        centroid = calculate_cluster_centroid(df, assignments, cluster_id)
+        if centroid:
+            centroids[cluster_id] = centroid
+    
+    if len(centroids) < 2:
+        return 0.0
+    
+    overlap_count = 0
+    total_count = 0
+    
+    for node_idx, assigned_cluster in assignments.items():
+        if assigned_cluster not in centroids:
+            continue
+        
+        node_lat = float(df.iloc[node_idx]['lat'])
+        node_lon = float(df.iloc[node_idx]['lon'])
+        
+        own_centroid = centroids[assigned_cluster]
+        own_dist = haversine(node_lat, node_lon, own_centroid[0], own_centroid[1])
+        
+        # 다른 클러스터 중심과의 거리 중 최소값
+        min_other_dist = float('inf')
+        for other_cluster, other_centroid in centroids.items():
+            if other_cluster == assigned_cluster:
+                continue
+            other_dist = haversine(node_lat, node_lon, other_centroid[0], other_centroid[1])
+            min_other_dist = min(min_other_dist, other_dist)
+        
+        # 다른 클러스터 중심이 더 가까우면 "교차"로 판정
+        if min_other_dist < own_dist:
+            overlap_count += 1
+        
+        total_count += 1
+    
+    if total_count == 0:
+        return 0.0
+    
+    return round(overlap_count / total_count * 100, 1)
 
 
 if __name__ == "__main__":
