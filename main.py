@@ -306,7 +306,7 @@ def optimize_routes(body: RequestBody):
                 "algorithm": "V12: Pure OR-Tools CVRP",
                 "max_capa_violations": len(violations),
                 "cluster_overlap": "N/A (OR-Tools가 자유롭게 배정)",
-                "note": "클러스터링 없이 순수 거리 최적화"
+                "note": "클러스터링 없이 순수 거리 최적화 "
             }
         }
         
