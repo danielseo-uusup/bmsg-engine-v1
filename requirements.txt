@@ -2,7 +2,9 @@ fastapi
 uvicorn
 pandas
 numpy
+scipy
 ortools
 scikit-learn
-scipy
 shapely
+psycopg2-binary
+requests
