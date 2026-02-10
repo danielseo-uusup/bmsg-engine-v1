@@ -11,7 +11,7 @@ from psycopg2.extras import execute_batch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =====================
-# 환경 설정 (GitHub Actions용 - 환경변수 사용)
+# 환경 설정 (GitHub Actions용 - 환경변수만 사용)
 # =====================
 class Config:
     # Airtable
@@ -118,6 +118,25 @@ class SyncJob:
         else:
             conditions = [f"IS_AFTER({{{f}}}, '{cutoff_date}')" for f in fields]
             return f"OR({', '.join(conditions)})"
+            
+    def _ensure_columns(self, cur, new_columns):
+        """
+        테이블에 컬럼이 없으면 자동으로 추가 (Schema Migration)
+        new_columns: {"column_name": "data_type"} 형태의 딕셔너리
+        """
+        try:
+            # 현재 테이블의 컬럼 조회
+            cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{self.db_table}'")
+            existing_columns = set(row[0] for row in cur.fetchall())
+            
+            for col_name, data_type in new_columns.items():
+                if col_name not in existing_columns:
+                    print(f"⚠️ 컬럼 추가 감지: {self.db_table}.{col_name} ({data_type})")
+                    cur.execute(f"ALTER TABLE {self.db_table} ADD COLUMN IF NOT EXISTS {col_name} {data_type}")
+            
+            # 커밋은 호출하는 쪽에서 수행하거나, 여기서 수행
+        except Exception as e:
+            print(f"❌ 컬럼 추가 중 오류: {e}")
     
     def fetch_records(self):
         headers = {"Authorization": f"Bearer {Config.AIRTABLE_API_KEY}"}
@@ -294,7 +313,7 @@ class BmsgRecordsSync(SyncJob):
                 "last_modified_time": Utils.convert_to_string(fields.get("Last Modified")),
                 "gu_dong": Utils.convert_to_string(fields.get("구+동")),
                 "maeip_total": Utils.convert_to_string(fields.get("매입액합계")),
-                "visit_request_date": Utils.convert_to_string(fields.get("방문 희망 날짜")),
+                "visit_request_date": Utils.convert_to_string(fields.get("방문희망일시")),
                 "created_date": Utils.convert_to_string(fields.get("생성일")),
                 "assigned_rider": Utils.convert_to_string(fields.get("수거기사배정(text)")),
                 "pickup_number": Utils.convert_to_string(fields.get("수거번호")),
@@ -376,6 +395,13 @@ class InventorySync(SyncJob):
         )
     
     def _save_records(self, records, existing_ids, cur, conn):
+        # 스키마 마이그레이션 확인
+        self._ensure_columns(cur, {
+            "stock_change_id": "TEXT",
+            "site_ref": "TEXT"
+        })
+        conn.commit()
+
         batch_data = []
         
         for rec in records:
@@ -410,6 +436,7 @@ class InventorySync(SyncJob):
                 "weight": Utils.convert_to_string(fields.get("무게")),
                 "change_weight": Utils.convert_to_string(fields.get("변동무게")),
                 "site_text": Utils.convert_to_string(fields.get("Site_Text")),
+                "site_ref": Utils.convert_to_string(fields.get("Site_ref")),
                 "batch_weight": Utils.convert_to_string(fields.get("무게 (from 배치번호)")),
                 "note": Utils.convert_to_string(fields.get("note")),
                 "outbound_weight_check": Utils.convert_to_string(fields.get("출고무게 확인")),
@@ -423,7 +450,9 @@ class InventorySync(SyncJob):
                 "last_modified_2": Utils.convert_to_string(fields.get("Last Modified 2")),
                 "last_modified_by_2": Utils.convert_to_string(fields.get("Last Modified By 2")),
                 "input_manager_2": Utils.convert_to_string(fields.get("입력담당 2")),
+                "input_manager_2": Utils.convert_to_string(fields.get("입력담당 2")),
                 "input_manager_text_2": Utils.convert_to_string(fields.get("입력담당_text 2")),
+                "stock_change_id": Utils.convert_to_string(fields.get("재고변동ID")),
                 "raw_json": json.dumps(rec, ensure_ascii=False, default=str)
             })
         
@@ -435,10 +464,10 @@ class InventorySync(SyncJob):
                     stock_change_datetime, stock_change_date_parsed, date_reference,
                     sales_number, customer_name, site, stock_change, stock_change_channel,
                     rollup_manager, apartment, sales_weight, weight, change_weight,
-                    site_text, batch_weight, note, outbound_weight_check, inbound_weight_check,
+                    site_text, site_ref, batch_weight, note, outbound_weight_check, inbound_weight_check,
                     temp_value, last_modified_by, input_manager, input_manager_text,
                     channel_2, batch_total_weight, last_modified_2, last_modified_by_2,
-                    input_manager_2, input_manager_text_2, raw_json
+                    input_manager_2, input_manager_text_2, stock_change_id, raw_json
                 )
                 VALUES (
                     %(record_id)s, %(created_time)s, %(last_modified_time)s, %(batch_number)s,
@@ -447,12 +476,12 @@ class InventorySync(SyncJob):
                     %(stock_change_date_parsed)s, %(date_reference)s, %(sales_number)s,
                     %(customer_name)s, %(site)s, %(stock_change)s, %(stock_change_channel)s,
                     %(rollup_manager)s, %(apartment)s, %(sales_weight)s, %(weight)s,
-                    %(change_weight)s, %(site_text)s, %(batch_weight)s, %(note)s,
+                    %(change_weight)s, %(site_text)s, %(site_ref)s, %(batch_weight)s, %(note)s,
                     %(outbound_weight_check)s, %(inbound_weight_check)s, %(temp_value)s,
                     %(last_modified_by)s, %(input_manager)s, %(input_manager_text)s,
                     %(channel_2)s, %(batch_total_weight)s, %(last_modified_2)s,
                     %(last_modified_by_2)s, %(input_manager_2)s, %(input_manager_text_2)s,
-                    %(raw_json)s
+                    %(stock_change_id)s, %(raw_json)s
                 )
                 ON CONFLICT (record_id) DO UPDATE SET
                     last_modified_time = EXCLUDED.last_modified_time,
@@ -478,6 +507,7 @@ class InventorySync(SyncJob):
                     weight = EXCLUDED.weight,
                     change_weight = EXCLUDED.change_weight,
                     site_text = EXCLUDED.site_text,
+                    site_ref = EXCLUDED.site_ref,
                     batch_weight = EXCLUDED.batch_weight,
                     note = EXCLUDED.note,
                     outbound_weight_check = EXCLUDED.outbound_weight_check,
@@ -491,7 +521,8 @@ class InventorySync(SyncJob):
                     last_modified_2 = EXCLUDED.last_modified_2,
                     last_modified_by_2 = EXCLUDED.last_modified_by_2,
                     input_manager_2 = EXCLUDED.input_manager_2,
-                    input_manager_text_2 = EXCLUDED.input_manager_text_2
+                    input_manager_text_2 = EXCLUDED.input_manager_text_2,
+                    stock_change_id = EXCLUDED.stock_change_id
             """, batch_data, page_size=100)
             
             conn.commit()
@@ -503,11 +534,22 @@ class RevenueSync(SyncJob):
             name="판매(revenue)",
             table_id="tblFBD10lHsDna9Ox",
             db_table="airtable_revenue",
-            sync_type="incremental",
+            # sync_type="incremental",
+            # days=30
+            # [2026-01-13] Rev_type 등 신규 필드 데이터 백필을 위해 일시적으로 full sync로 변경
+            sync_type="full",
             days=30
         )
 
     def _save_records(self, records, existing_ids, cur, conn):
+        # 스키마 마이그레이션 확인
+        self._ensure_columns(cur, {
+            "rev_type": "TEXT",
+            "outbound_location_text": "TEXT",
+            "sales_number": "TEXT"
+        })
+        conn.commit()
+
         batch_data = []
 
         for rec in records:
@@ -525,7 +567,8 @@ class RevenueSync(SyncJob):
                 "date_value": Utils.convert_to_string(fields.get("날짜")),
                 "customer_name": Utils.convert_to_string(fields.get("고객명")),
                 "channel_1": Utils.convert_to_string(fields.get("채널-1")),
-                "channel_2": Utils.convert_to_string(fields.get("채널-2")),
+                # "1차 내수" -> "1차내수" 등 띄어쓰기 제거 정규화
+                "channel_2": Utils.convert_to_string(fields.get("채널-2")).replace(" ", "") if fields.get("채널-2") else None,
                 "product": Utils.convert_to_string(fields.get("상품")),
                 "payment_type": Utils.convert_to_string(fields.get("지불형태")),
                 "revenue_migration": Utils.convert_to_string(fields.get("매출액(migration)")),
@@ -562,6 +605,9 @@ class RevenueSync(SyncJob):
                 "customer_name_text": Utils.convert_to_string(fields.get("고객명_text")),
                 "author": Utils.convert_to_string(fields.get("작성자")),
                 "customer_value": Utils.convert_to_string(fields.get("고객")),
+                "rev_type": Utils.convert_to_string(fields.get("Rev_type")),
+                "outbound_location_text": Utils.convert_to_string(fields.get("출고위치_text")),
+                "sales_number": Utils.convert_to_string(fields.get("판매번호")),
                 "raw_json": json.dumps(rec, ensure_ascii=False, default=str)
             })
 
@@ -579,7 +625,7 @@ class RevenueSync(SyncJob):
                     total_transaction_weight, project, revenue_per_weight, note,
                     stock_instagram, stock_change_type, unique_sale, sale_order,
                     last_modified_by, customer_name_text, author, customer_value,
-                    raw_json
+                    rev_type, outbound_location_text, sales_number, raw_json
                 )
                 VALUES (
                     %(record_id)s, %(created_time)s, %(last_modified_time)s,
@@ -596,7 +642,8 @@ class RevenueSync(SyncJob):
                     %(project)s, %(revenue_per_weight)s, %(note)s,
                     %(stock_instagram)s, %(stock_change_type)s, %(unique_sale)s,
                     %(sale_order)s, %(last_modified_by)s, %(customer_name_text)s,
-                    %(author)s, %(customer_value)s, %(raw_json)s
+                    %(author)s, %(customer_value)s, %(rev_type)s,
+                    %(outbound_location_text)s, %(sales_number)s, %(raw_json)s
                 )
                 ON CONFLICT (record_id) DO UPDATE SET
                     last_modified_time = EXCLUDED.last_modified_time,
@@ -641,7 +688,10 @@ class RevenueSync(SyncJob):
                     last_modified_by = EXCLUDED.last_modified_by,
                     customer_name_text = EXCLUDED.customer_name_text,
                     author = EXCLUDED.author,
-                    customer_value = EXCLUDED.customer_value
+                    customer_value = EXCLUDED.customer_value,
+                    rev_type = EXCLUDED.rev_type,
+                    outbound_location_text = EXCLUDED.outbound_location_text,
+                    sales_number = EXCLUDED.sales_number
             """, batch_data, page_size=100)
 
             conn.commit()
@@ -658,6 +708,12 @@ class PickupDashboardSync(SyncJob):
         )
 
     def _save_records(self, records, existing_ids, cur, conn):
+        # 스키마 마이그레이션 확인
+        self._ensure_columns(cur, {
+            "date_value": "TEXT"
+        })
+        conn.commit()
+
         batch_data = []
 
         for rec in records:
@@ -688,6 +744,7 @@ class PickupDashboardSync(SyncJob):
                 "month_value": Utils.convert_to_string(fields.get("월")),
                 "week_value": Utils.convert_to_string(fields.get("주")),
                 "date_text": Utils.convert_to_string(fields.get("날짜_text")),
+                "date_value": Utils.convert_to_string(fields.get("날짜")),
                 "raw_json": json.dumps(rec, ensure_ascii=False, default=str)
             })
 
@@ -698,7 +755,7 @@ class PickupDashboardSync(SyncJob):
                     goal_self_weight_2024, visit_apartment_kg, visit_kg, apartment_kg,
                     charan_kg, visit_ratio, apartment_ratio, self_ratio, charan_ratio,
                     apartment_event, charan_event, visit_event, month_value,
-                    week_value, date_text, raw_json
+                    week_value, date_text, date_value, raw_json
                 )
                 VALUES (
                     %(record_id)s, %(created_time)s, %(last_modified_time)s,
@@ -707,7 +764,7 @@ class PickupDashboardSync(SyncJob):
                     %(charan_kg)s, %(visit_ratio)s, %(apartment_ratio)s,
                     %(self_ratio)s, %(charan_ratio)s, %(apartment_event)s,
                     %(charan_event)s, %(visit_event)s, %(month_value)s,
-                    %(week_value)s, %(date_text)s, %(raw_json)s
+                    %(week_value)s, %(date_text)s, %(date_value)s, %(raw_json)s
                 )
                 ON CONFLICT (record_id) DO UPDATE SET
                     last_modified_time = EXCLUDED.last_modified_time,
@@ -728,7 +785,8 @@ class PickupDashboardSync(SyncJob):
                     visit_event = EXCLUDED.visit_event,
                     month_value = EXCLUDED.month_value,
                     week_value = EXCLUDED.week_value,
-                    date_text = EXCLUDED.date_text
+                    date_text = EXCLUDED.date_text,
+                    date_value = EXCLUDED.date_value
             """, batch_data, page_size=100)
 
             conn.commit()
@@ -1287,6 +1345,7 @@ class SyncOrchestrator:
             last_modified_by_2 TEXT,
             input_manager_2 TEXT,
             input_manager_text_2 TEXT,
+            stock_change_id TEXT,
             raw_json JSONB,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
@@ -1339,6 +1398,9 @@ class SyncOrchestrator:
             customer_name_text TEXT,
             author TEXT,
             customer_value TEXT,
+            rev_type TEXT,
+            outbound_location_text TEXT,
+            sales_number TEXT,
             raw_json JSONB,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
@@ -1367,6 +1429,7 @@ class SyncOrchestrator:
             month_value TEXT,
             week_value TEXT,
             date_text TEXT,
+            date_value TEXT,
             raw_json JSONB,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
@@ -1429,7 +1492,6 @@ class SyncOrchestrator:
 if __name__ == "__main__":
     # 환경변수 검증
     Config.validate()
-    
     orchestrator = SyncOrchestrator()
     
     # 동기화 작업 등록
